@@ -58,4 +58,4 @@ url=`echo $rawjson | jq -r -c '.computer.Linux.releases | .[] | select(.url | co
 
 wget $url -O $TMP_DIR/plex_binary
 
-sudo apt install $TMP_DIR/plex_binary
+sudo dpkg -i $TMP_DIR/plex_binary
