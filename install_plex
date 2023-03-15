@@ -56,6 +56,6 @@ fi
 
 url=`echo $rawjson | jq -r -c '.computer.Linux.releases | .[] | select(.url | contains("'$ARCH'")) | select(.distro == "'$DISTRO'") | .url'`
 
-wget $url -P $TMP_DIR -O plex_binary
+wget $url -O $TMP_DIR/plex_binary
 
 sudo apt install /tmp/plex_binary
