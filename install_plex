@@ -9,10 +9,12 @@ DISTRO="debian"
 
 function help(){
     cat << help_eof 
-Usage: install_go.sh <options> 
+Usage: install_plex <options> 
 Options:
-    -v/--version <go version>           (default: $VERSION)
-    -t/--tmp_dir <temp dir location>    (default: $TMP_DIR)
+    -t/--token <plex token>
+    -d/--distro os distro            (default: $DISTRO)
+    -a/--arch os arch                (default: $ARCH)
+    --tmp_dir <temp dir location>    (default: $TMP_DIR)
 help_eof
 
 }
@@ -34,7 +36,7 @@ while [[ $# -gt 0 ]]; do
       shift
       shift
       ;;
-    -t|--tmp_dir)
+    --tmp_dir)
       TMP_DIR="$2"
       shift
       shift
