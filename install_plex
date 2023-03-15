@@ -1,0 +1,59 @@
+#!/bin/bash
+
+set -e
+
+TMP_DIR=/tmp
+TOKEN=""
+ARCH="amd64"
+DISTRO="debian"
+
+function help(){
+    cat << help_eof 
+Usage: install_go.sh <options> 
+Options:
+    -v/--version <go version>           (default: $VERSION)
+    -t/--tmp_dir <temp dir location>    (default: $TMP_DIR)
+help_eof
+
+}
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -t|--token)
+      TOKEN="$2"
+      shift
+      shift
+      ;;
+    -d|--distro)
+      DISTRO="$2"
+      shift
+      shift
+      ;;
+    -a|--arch)
+      ARCH="$2"
+      shift
+      shift
+      ;;
+    -t|--tmp_dir)
+      TMP_DIR="$2"
+      shift
+      shift
+      ;;
+    -h|--help)
+      help
+      exit 0
+      ;;
+  esac
+done
+
+if [[ -z "$TOKEN" ]]; then
+    rawjson=`curl -s "https://plex.tv/api/downloads/5.json"`
+else
+    rawjson=`curl -s "https://plex.tv/api/downloads/5.json?channel=plexpass" -H "X-Plex-Token: $TOKEN"`
+fi
+
+url=`echo $rawjson | jq -r -c '.computer.Linux.releases | .[] | select(.url | contains("'$ARCH'")) | select(.distro == "'$DISTRO'") | .url'`
+
+wget $url -P $TMP_DIR -O plex_binary
+
+sudo apt install /tmp/plex_binary

@@ -3,7 +3,9 @@
 POSITIONAL_ARGS=()
 
 function help(){
-    echo "Usage: sample.sh -e, -s, -d"
+    cat << help_eof 
+    "Usage: sample.sh -e, -s, -d"
+help_eof
 }
 
 while [[ $# -gt 0 ]]; do
