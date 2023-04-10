@@ -1,45 +1,48 @@
 #!/bin/bash
 
+#display and exit-on-error for all commands
 set -e
 
-VERSION=1.20.1
-TMP_DIR=/tmp
+echo "Installing golang"
 
-function help(){
-    cat << help_eof 
-Usage: install_go.sh <options> 
-Options:
-    -v/--version <go version>           (default: $VERSION)
-    -t/--tmp_dir <temp dir location>    (default: $TMP_DIR)
-help_eof
+GO_VERSION=""
+usage()
+{
 
+cat << eof
+usage: install_go.sh <options>
+-v, --version      go version to install (Optional: if not provided latest version is installed)
+-h, --help         get usage info
+eof
 }
 
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    -v|--version)
-      VERSION="$2"
-      shift
-      shift
-      ;;
-    -t|--tmp_dir)
-      TMP_DIR="$2"
-      shift
-      shift
-      ;;
-    -h|--help)
-      help
-      exit 0
-      ;;
-  esac
+while [ "$1" != "" ]; do
+    PARAM=`echo $1 | awk -F= '{print $1}'`
+    VALUE=`echo $1 | awk -F= '{print $2}'`
+    case $PARAM in
+        -v | --version )
+            GO_VERSION=go$(echo $VALUE | tr -d '"')
+        ;;
+        -h | --help )
+            usage
+            exit
+    esac
+    shift
 done
 
-pushd $TMP_DIR
+if [[ -z "$GO_VERSION" ]]; then
+    GO_VERSION="$(curl -L https://golang.org/VERSION?m=text)"
+fi
 
-wget https://go.dev/dl/go$VERSION.linux-amd64.tar.gz
+pushd /tmp
+echo "Downloading go version $GO_VERSION"
+wget https://golang.org/dl/$GO_VERSION.linux-amd64.tar.gz
+[ -d /usr/local/go ] && sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf $GO_VERSION.linux-amd64.tar.gz
 
-sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go$VERSION.linux-amd64.tar.gz
+# cat << eof >> /home/$APP_USER/.bash_profile
 
+# export PATH=$PATH:/usr/local/go/bin:/usr/local/bin
+# eof
 
 popd
