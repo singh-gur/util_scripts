@@ -2,6 +2,7 @@
 
 #display and exit-on-error for all commands
 set -e
+set +v
 
 echo "Installing golang"
 
@@ -31,7 +32,14 @@ while [ "$1" != "" ]; do
 done
 
 if [[ -z "$GO_VERSION" ]]; then
-    GO_VERSION="$(curl -L https://golang.org/VERSION?m=text)"
+    GO_VERSION="$(curl -s -L https://golang.org/VERSION?m=text | head -n 1)"
+fi
+
+if command -v go &> /dev/null
+then
+    CURR_VERSION="$(go version | cut -d ' ' -f 3)"
+    [[ "$CURR_VERSION" == "$GO_VERSION" ]] && { echo "$GO_VERSION already installed !!"; exit 0; }
+    echo "Current Version: $CURR_VERSION"
 fi
 
 pushd /tmp
