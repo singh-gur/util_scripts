@@ -55,9 +55,4 @@ wget https://golang.org/dl/$GO_VERSION.linux-amd64.tar.gz
 [ -d /usr/local/go ] && sudo rm -rf /usr/local/go
 sudo tar -C /usr/local -xzf $GO_VERSION.linux-amd64.tar.gz
 
-# cat << eof >> /home/$APP_USER/.bash_profile
-
-# export PATH=$PATH:/usr/local/go/bin:/usr/local/bin
-# eof
-
 popd
