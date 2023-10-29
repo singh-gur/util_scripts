@@ -7,6 +7,8 @@ set +v
 echo "Installing golang"
 
 GO_VERSION=""
+FORCE=""
+
 usage()
 {
 
@@ -24,6 +26,9 @@ while [ "$1" != "" ]; do
         -v | --version )
             GO_VERSION=go$(echo $VALUE | tr -d '"')
         ;;
+        -f | --force )
+            FORCE="Y"
+        ;;
         -h | --help )
             usage
             exit
@@ -35,11 +40,13 @@ if [[ -z "$GO_VERSION" ]]; then
     GO_VERSION="$(curl -s -L https://golang.org/VERSION?m=text | head -n 1)"
 fi
 
-if command -v go &> /dev/null
-then
-    CURR_VERSION="$(go version | cut -d ' ' -f 3)"
-    [[ "$CURR_VERSION" == "$GO_VERSION" ]] && { echo "$GO_VERSION already installed !!"; exit 0; }
-    echo "Current Version: $CURR_VERSION"
+if [[ -z "$FORCE" ]]; then
+    if command -v go &> /dev/null
+    then
+        CURR_VERSION="$(go version | cut -d ' ' -f 3)"
+        [[ "$CURR_VERSION" == "$GO_VERSION" ]] && { echo "$GO_VERSION already installed !!"; exit 0; }
+        echo "Current Version: $CURR_VERSION"
+    fi
 fi
 
 pushd /tmp
