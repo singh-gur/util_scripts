@@ -9,6 +9,7 @@ echo "Postgres S3 Backup Script"
 HOST=""
 PORT="5432"
 DBNAME="postgres"
+ALL_DB="false"
 USER="postgres"
 PASSWORD=""
 S3_BUCKET=""
@@ -24,11 +25,12 @@ usage: pg_s3_backup.sh [options]
 --host,-h          Hostname of the postgres server
 --port,-p          Port of the postgres server
 --dbname,-d        Name of the database to backup
+--all,-a           Backup all databases
 --user,-u          Username to connect to the database
 --password,-w      Password to connect to the database
 --s3-bucket,-b     S3 Bucket to upload the backup
 --s3-prefix,-s     S3 Prefix to upload the backup
---aws-profile,-a   AWS Profile to use for the upload
+--aws-profile,-r   AWS Profile to use for the upload
 eof
 }
 
@@ -45,6 +47,10 @@ while [ "$1" != "" ]; do
         -d | --dbname )
             DBNAME=$(echo $VALUE | tr -d '"')
         ;;
+        -a | --all )
+            ALL_DB="true"
+            DBNAME="all"
+        ;;
         -u | --user )
             USER=$(echo $VALUE | tr -d '"')
         ;;
@@ -57,7 +63,7 @@ while [ "$1" != "" ]; do
         -s | --s3-prefix )
             S3_PREFIX=$(echo $VALUE | tr -d '"')
         ;;
-        -a | --aws-profile )
+        -r | --aws-profile )
             AWS_PROFILE=$(echo $VALUE | tr -d '"')
         ;;
         -h | --help )
@@ -71,7 +77,13 @@ YEAR=$(date +%Y)
 MONTH=$(date +%m)
 DAY_WITH_TIME=$(date +%d_%H%M%S)
 
-FILENAME="$DBNAME-$YEAR-$MONTH-$DAY_WITH_TIME.tar"
-PGPASSWORD="$PASSWORD" pg_dump -h $HOST -p $PORT -U $USER -d $DBNAME -w -F t -b -v -f /tmp/$FILENAME
+FILENAME="$DBNAME-$YEAR-$MONTH-$DAY_WITH_TIME.sql"
+
+if [ "$ALL_DB" = "true" ]; then
+    PGPASSWORD="$PASSWORD" pg_dumpall -h $HOST -p $PORT -U $USER -w -v -f /tmp/$FILENAME
+else
+    PGPASSWORD="$PASSWORD" pg_dump -h $HOST -p $PORT -U $USER -d $DBNAME -w -b -v -f /tmp/$FILENAME
+fi
+
 aws s3 cp /tmp/$FILENAME s3://$S3_BUCKET/$S3_PREFIX/$FILENAME --profile $AWS_PROFILE
 
