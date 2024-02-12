@@ -6,7 +6,7 @@ set +v
 
 echo "Postgres S3 Backup Script"
 
-HOST=""
+HOST="localhost"
 PORT="5432"
 DBNAME="postgres"
 ALL_DB="false"
