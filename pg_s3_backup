@@ -86,4 +86,4 @@ else
 fi
 
 aws s3 cp /tmp/$FILENAME s3://$S3_BUCKET/$S3_PREFIX/$FILENAME --profile $AWS_PROFILE
-
+rm /tmp/$FILENAME
