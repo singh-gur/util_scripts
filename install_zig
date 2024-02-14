@@ -1,0 +1,59 @@
+#!/bin/bash
+
+#display and exit-on-error for all commands
+set -e
+set +v
+
+echo "Installing zig"
+
+ZIG_VERSION=""
+FORCE=""
+
+usage()
+{
+
+cat << eof
+usage: install_zig <options>
+-v, --version      zig version to install (Optional: if not provided latest version is installed)
+-h, --help         get usage info
+eof
+}
+
+while [ "$1" != "" ]; do
+    PARAM=`echo $1 | awk -F= '{print $1}'`
+    VALUE=`echo $1 | awk -F= '{print $2}'`
+    case $PARAM in
+        -v | --version )
+            ZIG_VERSION=$(echo $VALUE | tr -d '"')
+        ;;
+        -f | --force )
+            FORCE="Y"
+        ;;
+        -h | --help )
+            usage
+            exit
+    esac
+    shift
+done
+
+if [[ -z "$ZIG_VERSION" ]]; then
+    ZIG_VERSION="$(curl -s https://api.github.com/repos/ziglang/zig/releases/latest | jq .tag_name -r)"
+fi
+
+if [[ -z "$FORCE" ]]; then
+    if command -v zig &> /dev/null
+    then
+        CURR_VERSION="$(zig version)"
+        [[ "$CURR_VERSION" == "$ZIG_VERSION" ]] && { echo "$ZIG_VERSION already installed !!"; exit 0; }
+        echo "Current Version: $CURR_VERSION"
+    fi
+fi
+
+cd /tmp
+echo "Downloading zig version $ZIG_VERSION"
+wget https://ziglang.org/download/$ZIG_VERSION/zig-linux-$(uname -m)-$ZIG_VERSION.tar.xz
+cd -
+[ -d /usr/local/zig ] && sudo rm -rf /usr/local/zig
+sudo mkdir -p /usr/local/zig
+sudo tar --strip=1 -C /usr/local/zig -xf /tmp/zig-linux-$(uname -m)-$ZIG_VERSION.tar.xz
+sudo rm /tmp/zig-linux-$(uname -m)-$ZIG_VERSION.tar.xz
