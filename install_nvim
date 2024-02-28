@@ -1,0 +1,57 @@
+#!/bin/bash
+
+#display and exit-on-error for all commands
+set -e
+set +v
+
+echo "Installing neovim"
+
+NVIM_VERSION=""
+FORCE=""
+
+usage()
+{
+
+cat << eof
+usage: install_nvim <options>
+-v, --version      nvim version to install (Optional: if not provided latest version is installed)
+-h, --help         get usage info
+eof
+}
+
+while [ "$1" != "" ]; do
+    PARAM=`echo $1 | awk -F= '{print $1}'`
+    VALUE=`echo $1 | awk -F= '{print $2}'`
+    case $PARAM in
+        -v | --version )
+            NVIM_VERSION=$(echo $VALUE | tr -d '"')
+        ;;
+        -f | --force )
+            FORCE="Y"
+        ;;
+        -h | --help )
+            usage
+            exit
+    esac
+    shift
+done
+
+if [[ -z "$NVIM_VERSION" ]]; then
+    NVIM_VERSION="$(curl -s https://api.github.com/repos/neovim/neovim/releases/latest | jq .tag_name -r)"
+fi
+
+if [[ -z "$FORCE" ]]; then
+    if command -v nvim &> /dev/null
+    then
+        CURR_VERSION="$(nvim --version | grep NVIM | tr -d "NVIM ")"
+        [[ "$CURR_VERSION" == "$NVIM_VERSION" ]] && { echo "$NVIM_VERSION already installed !!"; exit 0; }
+        echo "Current Version: $CURR_VERSION"
+    fi
+fi
+
+cd /tmp
+echo "Downloading nvim version $NVIM_VERSION"
+wget https://github.com/neovim/neovim/releases/download/$NVIM_VERSION/nvim.appimage
+mv ./nvim.appimage ./nvim
+sudo install ./nvim /usr/local/bin
+cd -
