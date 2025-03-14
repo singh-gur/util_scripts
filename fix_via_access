@@ -1,0 +1,9 @@
+#!/bin/bash
+
+sudo groupadd plugdev
+sudo usermod -aG plugdev $USER
+cat << 'eof' | sudo tee /etc/udev/rules.d/99-hidraw.rules
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", MODE="0664", GROUP="plugdev"
+eof
+sudo udevadm control --reload-rules
+
