@@ -51,7 +51,7 @@ fi
 
 cd /tmp
 echo "Downloading nvim version $NVIM_VERSION"
-wget https://github.com/neovim/neovim/releases/download/$NVIM_VERSION/nvim.appimage
-mv ./nvim.appimage ./nvim
+wget https://github.com/neovim/neovim/releases/download/$NVIM_VERSION/nvim-linux-$(uname -m).appimage
+mv ./nvim-linux-$(uname -m).appimage ./nvim
 sudo install ./nvim /usr/local/bin
 cd -
