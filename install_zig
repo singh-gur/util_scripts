@@ -51,9 +51,9 @@ fi
 
 cd /tmp
 echo "Downloading zig version $ZIG_VERSION"
-wget https://ziglang.org/download/$ZIG_VERSION/zig-linux-$(uname -m)-$ZIG_VERSION.tar.xz
+wget https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz
 cd -
 [ -d /usr/local/zig ] && sudo rm -rf /usr/local/zig
 sudo mkdir -p /usr/local/zig
-sudo tar --strip=1 -C /usr/local/zig -xf /tmp/zig-linux-$(uname -m)-$ZIG_VERSION.tar.xz
-sudo rm /tmp/zig-linux-$(uname -m)-$ZIG_VERSION.tar.xz
+sudo tar --strip=1 -C /usr/local/zig -xf /tmp/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz
+sudo rm /tmp/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz
