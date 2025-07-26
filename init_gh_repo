@@ -1,0 +1,143 @@
+#!/bin/bash
+
+POSITIONAL_ARGS=()
+
+function help(){
+    cat << help_eof 
+Usage: create_github_repo [options]
+Options:
+    -n, --name          Repository name (default: current directory name)
+    -d, --description   Repository description
+    -p, --private       Create private repository (default: public)
+    -r, --remote        Remote name (default: origin)
+    -h, --help          Show this help message
+
+This script creates a GitHub repository using the gh CLI tool and pushes
+the current directory to the newly created repository.
+
+Prerequisites:
+- gh CLI tool must be installed and authenticated
+- Current directory should be a git repository or will be initialized
+help_eof
+}
+
+# Default values
+REPO_NAME=$(basename "$PWD")
+DESCRIPTION=""
+PRIVATE="--public"
+REMOTE="origin"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -n|--name)
+      REPO_NAME="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -d|--description)
+      DESCRIPTION="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -p|--private)
+      PRIVATE="--private"
+      shift # past argument
+      ;;
+    -r|--remote)
+      REMOTE="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -h|--help)
+      help
+      exit 0
+      ;;
+    -*|--*)
+      echo "Unknown option $1"
+      echo "Use -h or --help for usage information"
+      exit 1
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1") # save positional arg
+      shift # past argument
+      ;;
+  esac
+done
+
+# Check if gh CLI is installed
+if ! command -v gh &> /dev/null; then
+    echo "Error: gh CLI tool is not installed"
+    echo "Please install it from: https://cli.github.com/"
+    exit 1
+fi
+
+# Check if authenticated with GitHub
+if ! gh auth status &> /dev/null; then
+    echo "Error: Not authenticated with GitHub"
+    echo "Please run: gh auth login"
+    exit 1
+fi
+
+echo "Repository Name: ${REPO_NAME}"
+echo "Description: ${DESCRIPTION:-"No description provided"}"
+echo "Visibility: $([ -n "$PRIVATE" ] && echo "Private" || echo "Public")"
+echo "Remote Name: ${REMOTE}"
+echo "Current Directory: $PWD"
+
+# Initialize git repository if not already initialized
+if [ ! -d ".git" ]; then
+    echo "Initializing git repository..."
+    git init
+    echo "Git repository initialized"
+fi
+
+# Create .gitignore if it doesn't exist
+if [ ! -f ".gitignore" ]; then
+    echo "Creating basic .gitignore..."
+    cat > .gitignore << 'EOF'
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+EOF
+fi
+
+# Add all files to git
+echo "Adding files to git..."
+git add .
+
+# Create initial commit if no commits exist
+if ! git rev-parse --verify HEAD &> /dev/null; then
+    echo "Creating initial commit..."
+    git commit -m "Initial commit"
+fi
+
+# Create GitHub repository
+echo "Creating GitHub repository..."
+if [ -n "$DESCRIPTION" ]; then
+    gh repo create "$REPO_NAME" $PRIVATE --description "$DESCRIPTION" --source . --remote "$REMOTE" --push
+else
+    gh repo create "$REPO_NAME" $PRIVATE --source . --remote "$REMOTE" --push
+fi
+
+if [ $? -eq 0 ]; then
+    echo "Successfully created and pushed to GitHub repository: $REPO_NAME"
+    echo "Repository URL: $(gh repo view --json url --jq '.url')"
+else
+    echo "Error: Failed to create GitHub repository"
+    exit 1
+fi
