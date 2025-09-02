@@ -68,8 +68,8 @@ usage() {
 usage: pg_s3_restore [options]
 
 Required:
-  -b, --s3-bucket BUCKET    S3 Bucket to download the backup from
-  -k, --s3-key KEY          S3 Key (filename) of the backup file
+  --bucket BUCKET          S3 Bucket to download the backup from
+  --key KEY                S3 Key (filename) of the backup file
 
 Optional:
   --host HOST               Hostname of the postgres server (default: $HOST)
@@ -78,17 +78,17 @@ Optional:
   -a, --all                 Restore all databases (for pg_dumpall backups)
   -u, --user USERNAME       Username to connect to the database (default: $USER)
   -w, --password PASSWORD   Password to connect to the database
-  -s, --s3-prefix PREFIX    S3 Prefix where the backup is located (default: $S3_PREFIX)
-  -r, --aws-profile PROFILE AWS Profile to use for the download (default: $AWS_PROFILE)
+  --prefix PREFIX          S3 Prefix where the backup is located (default: $S3_PREFIX)
+  --profile PROFILE        AWS Profile to use for the download (default: $AWS_PROFILE)
   --drop-if-exists          Drop database if it exists before restore (single DB only)
   --keep-local              Keep local backup file after restore
   --temp-dir DIR            Temporary directory for backup files (default: $TEMP_DIR)
   -h, --help                Show this help message
 
 Examples:
-  $0 --s3-bucket my-backups --s3-key mydb-20231201_143000.sql.gz --dbname mydb
-  $0 --s3-bucket my-backups --s3-key all-20231201_143000.sql --all
-  $0 --s3-bucket my-backups --s3-prefix production/ --s3-key mydb-backup.sql.gz --host db.example.com
+  $0 --bucket my-backups --key mydb-20231201_143000.sql.gz --dbname mydb
+  $0 --bucket my-backups --key all-20231201_143000.sql --all
+  $0 --bucket my-backups --prefix production/ --key mydb-backup.sql.gz --host db.example.com
 EOF
 }
 
@@ -139,35 +139,35 @@ while [[ $# -gt 0 ]]; do
             PASSWORD="${1#*=}"
             shift
             ;;
-        -b|--s3-bucket)
+        --bucket)
             S3_BUCKET="$2"
             shift 2
             ;;
-        -b=*|--s3-bucket=*)
+        --bucket=*)
             S3_BUCKET="${1#*=}"
             shift
             ;;
-        -s|--s3-prefix)
+        --prefix)
             S3_PREFIX="$2"
             shift 2
             ;;
-        -s=*|--s3-prefix=*)
+        --prefix=*)
             S3_PREFIX="${1#*=}"
             shift
             ;;
-        -k|--s3-key)
+        --key)
             S3_KEY="$2"
             shift 2
             ;;
-        -k=*|--s3-key=*)
+        --key=*)
             S3_KEY="${1#*=}"
             shift
             ;;
-        -r|--aws-profile)
+        --profile)
             AWS_PROFILE="$2"
             shift 2
             ;;
-        -r=*|--aws-profile=*)
+        --profile=*)
             AWS_PROFILE="${1#*=}"
             shift
             ;;
@@ -201,12 +201,12 @@ done
 
 validate_parameters() {
     if [[ -z "$S3_BUCKET" ]]; then
-        echo "Error: S3 bucket is required. Use -b or --s3-bucket" >&2
+        echo "Error: S3 bucket is required. Use --bucket" >&2
         exit 1
     fi
     
     if [[ -z "$S3_KEY" ]]; then
-        echo "Error: S3 key (backup filename) is required. Use -k or --s3-key" >&2
+        echo "Error: S3 key (backup filename) is required. Use --key" >&2
         exit 1
     fi
     
