@@ -16,6 +16,10 @@ S3_BUCKET=""
 S3_PREFIX=""
 S3_KEY=""
 AWS_PROFILE="default"
+AWS_ACCESS_KEY_ID=""
+AWS_SECRET_ACCESS_KEY=""
+AWS_REGION="us-east-1"
+AWS_ENDPOINT_URL=""
 KEEP_LOCAL="false"
 TEMP_DIR="/tmp"
 DROP_IF_EXISTS="false"
@@ -79,7 +83,11 @@ Optional:
   -u, --user USERNAME       Username to connect to the database (default: $USER)
   -w, --password PASSWORD   Password to connect to the database
   --prefix PREFIX          S3 Prefix where the backup is located (default: $S3_PREFIX)
-  --profile PROFILE        AWS Profile to use for the download (default: $AWS_PROFILE)
+  --aws-profile PROFILE    AWS Profile to use for the download (default: $AWS_PROFILE)
+  --aws-access-key-id KEY  AWS Access Key ID (overrides profile)
+  --aws-secret-key SECRET  AWS Secret Access Key (overrides profile)
+  --aws-region REGION      AWS Region (default: us-east-1)
+  --aws-endpoint-url URL   Custom AWS endpoint URL (for S3-compatible services)
   --drop-if-exists          Drop database if it exists before restore (single DB only)
   --keep-local              Keep local backup file after restore
   --temp-dir DIR            Temporary directory for backup files (default: $TEMP_DIR)
@@ -89,6 +97,8 @@ Examples:
   $0 --bucket my-backups --key mydb-20231201_143000.sql.gz --dbname mydb
   $0 --bucket my-backups --key all-20231201_143000.sql --all
   $0 --bucket my-backups --prefix production/ --key mydb-backup.sql.gz --host db.example.com
+  $0 --bucket my-backups --key mydb-backup.sql.gz --aws-access-key-id AKIAXXXXXXXX --aws-secret-key secretkey
+  $0 --bucket my-backups --key mydb-backup.sql.gz --aws-access-key-id AKIAXXXXXXXX --aws-secret-key secretkey --aws-endpoint-url http://localhost:9000
 EOF
 }
 
@@ -163,12 +173,44 @@ while [[ $# -gt 0 ]]; do
             S3_KEY="${1#*=}"
             shift
             ;;
-        --profile)
+        --aws-profile)
             AWS_PROFILE="$2"
             shift 2
             ;;
-        --profile=*)
+        --aws-profile=*)
             AWS_PROFILE="${1#*=}"
+            shift
+            ;;
+        --aws-access-key-id)
+            AWS_ACCESS_KEY_ID="$2"
+            shift 2
+            ;;
+        --aws-access-key-id=*)
+            AWS_ACCESS_KEY_ID="${1#*=}"
+            shift
+            ;;
+        --aws-secret-key)
+            AWS_SECRET_ACCESS_KEY="$2"
+            shift 2
+            ;;
+        --aws-secret-key=*)
+            AWS_SECRET_ACCESS_KEY="${1#*=}"
+            shift
+            ;;
+        --aws-region)
+            AWS_REGION="$2"
+            shift 2
+            ;;
+        --aws-region=*)
+            AWS_REGION="${1#*=}"
+            shift
+            ;;
+        --aws-endpoint-url)
+            AWS_ENDPOINT_URL="$2"
+            shift 2
+            ;;
+        --aws-endpoint-url=*)
+            AWS_ENDPOINT_URL="${1#*=}"
             shift
             ;;
         --drop-if-exists)
@@ -210,6 +252,28 @@ validate_parameters() {
         exit 1
     fi
     
+    # Validate AWS authentication method
+    local using_inline_creds=false
+    if [[ -n "$AWS_ACCESS_KEY_ID" || -n "$AWS_SECRET_ACCESS_KEY" || -n "$AWS_ENDPOINT_URL" ]]; then
+        using_inline_creds=true
+    fi
+    
+    if [[ "$using_inline_creds" == true ]]; then
+        # When using inline credentials, both access key and secret key are required
+        if [[ -z "$AWS_ACCESS_KEY_ID" ]]; then
+            echo "Error: AWS Access Key ID is required when using inline credentials. Use --aws-access-key-id" >&2
+            exit 1
+        fi
+        if [[ -z "$AWS_SECRET_ACCESS_KEY" ]]; then
+            echo "Error: AWS Secret Access Key is required when using inline credentials. Use --aws-secret-key" >&2
+            exit 1
+        fi
+        echo "Using inline AWS credentials"
+    else
+        # Using AWS profile authentication (default behavior)
+        echo "Using AWS profile: $AWS_PROFILE"
+    fi
+    
     if [[ ! -d "$TEMP_DIR" ]]; then
         echo "Error: Temporary directory '$TEMP_DIR' does not exist" >&2
         exit 1
@@ -248,11 +312,45 @@ download_from_s3() {
     echo "Downloading from S3..." >&2
     echo "Source: s3://$S3_BUCKET/$s3_key" >&2
     echo "Destination: $local_file" >&2
-    echo "AWS Profile: $AWS_PROFILE" >&2
     
-    if ! aws s3 cp "s3://$S3_BUCKET/$s3_key" "$local_file" --profile "$AWS_PROFILE" >&2; then
-        echo "Error: S3 download failed" >&2
-        exit 1
+    # Determine authentication method and execute download
+    local using_inline_creds=false
+    
+    # Check if using inline credentials
+    if [[ -n "$AWS_ACCESS_KEY_ID" ]]; then
+        using_inline_creds=true
+        export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+        export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+        export AWS_DEFAULT_REGION="$AWS_REGION"
+    fi
+    
+    # Execute download with appropriate authentication and endpoint
+    if [[ -n "$AWS_ENDPOINT_URL" ]]; then
+        echo "Using custom endpoint: $AWS_ENDPOINT_URL" >&2
+        if [[ "$using_inline_creds" == true ]]; then
+            if ! aws s3 cp "s3://$S3_BUCKET/$s3_key" "$local_file" --endpoint-url "$AWS_ENDPOINT_URL" >&2; then
+                echo "Error: S3 download failed" >&2
+                exit 1
+            fi
+        else
+            if ! aws s3 cp "s3://$S3_BUCKET/$s3_key" "$local_file" --profile "$AWS_PROFILE" --endpoint-url "$AWS_ENDPOINT_URL" >&2; then
+                echo "Error: S3 download failed" >&2
+                exit 1
+            fi
+        fi
+    else
+        # Standard AWS S3 endpoint
+        if [[ "$using_inline_creds" == true ]]; then
+            if ! aws s3 cp "s3://$S3_BUCKET/$s3_key" "$local_file" >&2; then
+                echo "Error: S3 download failed" >&2
+                exit 1
+            fi
+        else
+            if ! aws s3 cp "s3://$S3_BUCKET/$s3_key" "$local_file" --profile "$AWS_PROFILE" >&2; then
+                echo "Error: S3 download failed" >&2
+                exit 1
+            fi
+        fi
     fi
     
     if [[ ! -s "$local_file" ]]; then
