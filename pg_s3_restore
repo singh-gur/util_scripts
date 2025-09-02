@@ -24,11 +24,16 @@ CLEANUP_FILES=()
 
 cleanup() {
     local exit_code=$?
+    echo "DEBUG: Cleanup called with exit code: $exit_code"
+    echo "DEBUG: Files to clean: ${CLEANUP_FILES[*]}"
     echo "Cleaning up temporary files..."
     for file in "${CLEANUP_FILES[@]}"; do
         if [[ -f "$file" ]]; then
+            echo "DEBUG: Removing file: $file"
             rm -f "$file"
             echo "Removed: $file"
+        else
+            echo "DEBUG: File not found for cleanup: $file"
         fi
     done
     exit $exit_code
@@ -239,14 +244,13 @@ download_from_s3() {
     fi
     
     local local_file="$TEMP_DIR/$S3_KEY"
-    CLEANUP_FILES+=("$local_file")
     
-    echo "Downloading from S3..."
-    echo "Source: s3://$S3_BUCKET/$s3_key"
-    echo "Destination: $local_file"
-    echo "AWS Profile: $AWS_PROFILE"
+    echo "Downloading from S3..." >&2
+    echo "Source: s3://$S3_BUCKET/$s3_key" >&2
+    echo "Destination: $local_file" >&2
+    echo "AWS Profile: $AWS_PROFILE" >&2
     
-    if ! aws s3 cp "s3://$S3_BUCKET/$s3_key" "$local_file" --profile "$AWS_PROFILE"; then
+    if ! aws s3 cp "s3://$S3_BUCKET/$s3_key" "$local_file" --profile "$AWS_PROFILE" >&2; then
         echo "Error: S3 download failed" >&2
         exit 1
     fi
@@ -256,8 +260,12 @@ download_from_s3() {
         exit 1
     fi
     
+    # Add to cleanup files after successful download
+    CLEANUP_FILES+=("$local_file")
+    
     local file_size=$(du -h "$local_file" | cut -f1)
-    echo "Download completed successfully. File size: $file_size"
+    echo "Download completed successfully. File size: $file_size" >&2
+    echo "File exists check: $(ls -la "$local_file")" >&2
     
     echo "$local_file"
 }
@@ -267,15 +275,43 @@ decompress_if_needed() {
     local decompressed_file="$file_path"
     
     if [[ "$file_path" == *.gz ]]; then
-        echo "Decompressing backup file..."
-        if ! gzip -d "$file_path"; then
+        echo "Decompressing backup file..." >&2
+        decompressed_file="${file_path%.gz}"
+        
+        echo "Input file: $file_path" >&2
+        echo "Output file: $decompressed_file" >&2
+        
+        # Verify input file exists and is readable
+        if [[ ! -f "$file_path" ]]; then
+            echo "Error: Compressed file '$file_path' not found" >&2
+            exit 1
+        fi
+        
+        if [[ ! -r "$file_path" ]]; then
+            echo "Error: Cannot read compressed file '$file_path'" >&2
+            exit 1
+        fi
+        
+        # Use gunzip with explicit input/output to avoid path issues
+        if ! gunzip -c "$file_path" > "$decompressed_file"; then
             echo "Error: Decompression failed" >&2
             exit 1
         fi
-        decompressed_file="${file_path%.gz}"
+        
+        # Verify decompressed file was created successfully
+        if [[ ! -f "$decompressed_file" ]]; then
+            echo "Error: Decompressed file '$decompressed_file' was not created" >&2
+            exit 1
+        fi
+        
+        if [[ ! -s "$decompressed_file" ]]; then
+            echo "Error: Decompressed file '$decompressed_file' is empty" >&2
+            exit 1
+        fi
+        
         CLEANUP_FILES+=("$decompressed_file")
         local decompressed_size=$(du -h "$decompressed_file" | cut -f1)
-        echo "Decompression completed. Decompressed size: $decompressed_size"
+        echo "Decompression completed. Decompressed size: $decompressed_size" >&2
     fi
     
     echo "$decompressed_file"
@@ -283,8 +319,15 @@ decompress_if_needed() {
 
 perform_restore() {
     local backup_file
+    echo "DEBUG: Starting download..."
     backup_file=$(download_from_s3)
+    echo "DEBUG: Download returned: $backup_file"
+    echo "DEBUG: File exists after download: $(test -f "$backup_file" && echo "YES" || echo "NO")"
+    echo "DEBUG: Current cleanup files: ${CLEANUP_FILES[*]}"
+    
+    echo "DEBUG: Starting decompression..."
     backup_file=$(decompress_if_needed "$backup_file")
+    echo "DEBUG: Decompression returned: $backup_file"
     
     echo "Starting restore at $(date)"
     echo "Database: $DBNAME"
