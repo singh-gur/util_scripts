@@ -1,8 +1,8 @@
 #!/bin/bash
 
-#display and exit-on-error for all commands
 set -e
-set +v
+set -u
+set -o pipefail
 
 echo "Postgres S3 Backup Script"
 
@@ -15,75 +15,298 @@ PASSWORD=""
 S3_BUCKET=""
 S3_PREFIX=""
 AWS_PROFILE="default"
+COMPRESS="true"
+KEEP_LOCAL="false"
+TEMP_DIR="/tmp"
 
+CLEANUP_FILES=()
 
-usage()
-{
-
-cat << eof
-usage: pg_s3_backup.sh [options]
---host,-h          Hostname of the postgres server
---port,-p          Port of the postgres server
---dbname,-d        Name of the database to backup
---all,-a           Backup all databases
---user,-u          Username to connect to the database
---password,-w      Password to connect to the database
---s3-bucket,-b     S3 Bucket to upload the backup
---s3-prefix,-s     S3 Prefix to upload the backup
---aws-profile,-r   AWS Profile to use for the upload
-eof
+cleanup() {
+    local exit_code=$?
+    echo "Cleaning up temporary files..."
+    for file in "${CLEANUP_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            rm -f "$file"
+            echo "Removed: $file"
+        fi
+    done
+    exit $exit_code
 }
 
-while [ "$1" != "" ]; do
-    PARAM=`echo $1 | awk -F= '{print $1}'`
-    VALUE=`echo $1 | awk -F= '{print $2}'`
-    case $PARAM in
-        -h | --host )
-            HOST=$(echo $VALUE | tr -d '"')
-        ;;
-        -p | --port )
-            PORT=$(echo $VALUE | tr -d '"')
-        ;;
-        -d | --dbname )
-            DBNAME=$(echo $VALUE | tr -d '"')
-        ;;
-        -a | --all )
+trap cleanup EXIT
+
+validate_dependencies() {
+    local missing_deps=()
+    
+    if ! command -v pg_dump >/dev/null 2>&1; then
+        missing_deps+=("postgresql-client")
+    fi
+    
+    if ! command -v pg_dumpall >/dev/null 2>&1; then
+        missing_deps+=("postgresql-client")
+    fi
+    
+    if ! command -v aws >/dev/null 2>&1; then
+        missing_deps+=("awscli")
+    fi
+    
+    if [[ "$COMPRESS" == "true" ]] && ! command -v gzip >/dev/null 2>&1; then
+        missing_deps+=("gzip")
+    fi
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing_deps[*]}" >&2
+        echo "Please install the missing packages and try again." >&2
+        exit 1
+    fi
+}
+
+usage() {
+    cat << EOF
+usage: pg_s3_backup [options]
+
+Required:
+  -b, --s3-bucket BUCKET    S3 Bucket to upload the backup
+
+Optional:
+  --host HOST               Hostname of the postgres server (default: $HOST)
+  --port PORT               Port of the postgres server (default: $PORT)
+  -d, --dbname DATABASE     Name of the database to backup (default: $DBNAME)
+  -a, --all                 Backup all databases
+  -u, --user USERNAME       Username to connect to the database (default: $USER)
+  -w, --password PASSWORD   Password to connect to the database
+  -s, --s3-prefix PREFIX    S3 Prefix to upload the backup (default: $S3_PREFIX)
+  -r, --aws-profile PROFILE AWS Profile to use for the upload (default: $AWS_PROFILE)
+  --no-compress             Disable gzip compression
+  --keep-local              Keep local backup file after upload
+  --temp-dir DIR            Temporary directory for backup files (default: $TEMP_DIR)
+  -h, --help                Show this help message
+
+Examples:
+  $0 --s3-bucket my-backups --dbname mydb
+  $0 --s3-bucket my-backups --all --s3-prefix production/
+  $0 --s3-bucket my-backups --host db.example.com --user admin --password secret
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --host)
+            HOST="$2"
+            shift 2
+            ;;
+        --host=*)
+            HOST="${1#*=}"
+            shift
+            ;;
+        --port)
+            PORT="$2"
+            shift 2
+            ;;
+        --port=*)
+            PORT="${1#*=}"
+            shift
+            ;;
+        -d|--dbname)
+            DBNAME="$2"
+            shift 2
+            ;;
+        -d=*|--dbname=*)
+            DBNAME="${1#*=}"
+            shift
+            ;;
+        -a|--all)
             ALL_DB="true"
             DBNAME="all"
-        ;;
-        -u | --user )
-            USER=$(echo $VALUE | tr -d '"')
-        ;;
-        -w | --password )
-            PASSWORD=$(echo $VALUE | tr -d '"')
-        ;;
-        -b | --s3-bucket )
-            S3_BUCKET=$(echo $VALUE | tr -d '"')
-        ;;
-        -s | --s3-prefix )
-            S3_PREFIX=$(echo $VALUE | tr -d '"')
-        ;;
-        -r | --aws-profile )
-            AWS_PROFILE=$(echo $VALUE | tr -d '"')
-        ;;
-        -h | --help )
+            shift
+            ;;
+        -u|--user)
+            USER="$2"
+            shift 2
+            ;;
+        -u=*|--user=*)
+            USER="${1#*=}"
+            shift
+            ;;
+        -w|--password)
+            PASSWORD="$2"
+            shift 2
+            ;;
+        -w=*|--password=*)
+            PASSWORD="${1#*=}"
+            shift
+            ;;
+        -b|--s3-bucket)
+            S3_BUCKET="$2"
+            shift 2
+            ;;
+        -b=*|--s3-bucket=*)
+            S3_BUCKET="${1#*=}"
+            shift
+            ;;
+        -s|--s3-prefix)
+            S3_PREFIX="$2"
+            shift 2
+            ;;
+        -s=*|--s3-prefix=*)
+            S3_PREFIX="${1#*=}"
+            shift
+            ;;
+        -r|--aws-profile)
+            AWS_PROFILE="$2"
+            shift 2
+            ;;
+        -r=*|--aws-profile=*)
+            AWS_PROFILE="${1#*=}"
+            shift
+            ;;
+        --no-compress)
+            COMPRESS="false"
+            shift
+            ;;
+        --keep-local)
+            KEEP_LOCAL="true"
+            shift
+            ;;
+        --temp-dir)
+            TEMP_DIR="$2"
+            shift 2
+            ;;
+        --temp-dir=*)
+            TEMP_DIR="${1#*=}"
+            shift
+            ;;
+        -h|--help)
             usage
-            exit
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
     esac
-    shift
 done
 
-YEAR=$(date +%Y)
-MONTH=$(date +%m)
-DAY_WITH_TIME=$(date +%d_%H%M%S)
+validate_parameters() {
+    if [[ -z "$S3_BUCKET" ]]; then
+        echo "Error: S3 bucket is required. Use -b or --s3-bucket" >&2
+        exit 1
+    fi
+    
+    if [[ ! -d "$TEMP_DIR" ]]; then
+        echo "Error: Temporary directory '$TEMP_DIR' does not exist" >&2
+        exit 1
+    fi
+    
+    if [[ ! -w "$TEMP_DIR" ]]; then
+        echo "Error: Temporary directory '$TEMP_DIR' is not writable" >&2
+        exit 1
+    fi
+}
 
-FILENAME="$DBNAME-$YEAR-$MONTH-$DAY_WITH_TIME.sql"
+create_pgpass_file() {
+    if [[ -n "$PASSWORD" ]]; then
+        PGPASS_FILE="$TEMP_DIR/.pgpass.$$"
+        echo "$HOST:$PORT:*:$USER:$PASSWORD" > "$PGPASS_FILE"
+        chmod 600 "$PGPASS_FILE"
+        CLEANUP_FILES+=("$PGPASS_FILE")
+        export PGPASSFILE="$PGPASS_FILE"
+    fi
+}
 
-if [ "$ALL_DB" = "true" ]; then
-    PGPASSWORD="$PASSWORD" pg_dumpall -h $HOST -p $PORT -U $USER -w -v -f /tmp/$FILENAME
-else
-    PGPASSWORD="$PASSWORD" pg_dump -h $HOST -p $PORT -U $USER -d $DBNAME -w -b -v -f /tmp/$FILENAME
-fi
+perform_backup() {
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local base_filename="${DBNAME}-${timestamp}"
+    local sql_file="$TEMP_DIR/${base_filename}.sql"
+    
+    CLEANUP_FILES+=("$sql_file")
+    
+    echo "Starting backup at $(date)"
+    echo "Database: $DBNAME"
+    echo "Host: $HOST:$PORT"
+    echo "User: $USER"
+    echo "Output file: $sql_file"
+    
+    if [[ "$ALL_DB" == "true" ]]; then
+        echo "Performing full cluster backup (all databases)..."
+        if ! pg_dumpall -h "$HOST" -p "$PORT" -U "$USER" -w -v -f "$sql_file"; then
+            echo "Error: pg_dumpall failed" >&2
+            exit 1
+        fi
+    else
+        echo "Performing single database backup..."
+        if ! pg_dump -h "$HOST" -p "$PORT" -U "$USER" -d "$DBNAME" -w -b -v -f "$sql_file"; then
+            echo "Error: pg_dump failed" >&2
+            exit 1
+        fi
+    fi
+    
+    if [[ ! -s "$sql_file" ]]; then
+        echo "Error: Backup file is empty or was not created" >&2
+        exit 1
+    fi
+    
+    local file_size=$(du -h "$sql_file" | cut -f1)
+    echo "Backup completed successfully. File size: $file_size"
+    
+    local upload_file="$sql_file"
+    
+    if [[ "$COMPRESS" == "true" ]]; then
+        echo "Compressing backup..."
+        if ! gzip "$sql_file"; then
+            echo "Error: Compression failed" >&2
+            exit 1
+        fi
+        upload_file="${sql_file}.gz"
+        CLEANUP_FILES+=("$upload_file")
+        local compressed_size=$(du -h "$upload_file" | cut -f1)
+        echo "Compression completed. Compressed size: $compressed_size"
+    fi
+    
+    upload_to_s3 "$upload_file"
+    
+    if [[ "$KEEP_LOCAL" == "false" ]]; then
+        echo "Removing local backup file: $upload_file"
+    else
+        echo "Keeping local backup file: $upload_file"
+        for i in "${!CLEANUP_FILES[@]}"; do
+            if [[ "${CLEANUP_FILES[i]}" == "$upload_file" ]]; then
+                unset 'CLEANUP_FILES[i]'
+            fi
+        done
+    fi
+}
 
-aws s3 cp /tmp/$FILENAME s3://$S3_BUCKET/$S3_PREFIX/$FILENAME --profile $AWS_PROFILE
-rm /tmp/$FILENAME
+upload_to_s3() {
+    local file_path="$1"
+    local filename=$(basename "$file_path")
+    local s3_key="$S3_PREFIX$filename"
+    
+    if [[ -n "$S3_PREFIX" && ! "$S3_PREFIX" =~ /$ ]]; then
+        s3_key="$S3_PREFIX/$filename"
+    fi
+    
+    echo "Uploading to S3..."
+    echo "Source: $file_path"
+    echo "Destination: s3://$S3_BUCKET/$s3_key"
+    echo "AWS Profile: $AWS_PROFILE"
+    
+    if ! aws s3 cp "$file_path" "s3://$S3_BUCKET/$s3_key" --profile "$AWS_PROFILE"; then
+        echo "Error: S3 upload failed" >&2
+        exit 1
+    fi
+    
+    echo "Upload completed successfully"
+    echo "S3 URL: s3://$S3_BUCKET/$s3_key"
+}
+
+main() {
+    validate_dependencies
+    validate_parameters
+    create_pgpass_file
+    perform_backup
+    echo "Backup operation completed successfully at $(date)"
+}
+
+main "$@"
