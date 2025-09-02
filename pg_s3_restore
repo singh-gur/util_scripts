@@ -1,0 +1,339 @@
+#!/bin/bash
+
+set -e
+set -u
+set -o pipefail
+
+echo "Postgres S3 Restore Script"
+
+HOST="localhost"
+PORT="5432"
+DBNAME="postgres"
+ALL_DB="false"
+USER="postgres"
+PASSWORD=""
+S3_BUCKET=""
+S3_PREFIX=""
+S3_KEY=""
+AWS_PROFILE="default"
+KEEP_LOCAL="false"
+TEMP_DIR="/tmp"
+DROP_IF_EXISTS="false"
+
+CLEANUP_FILES=()
+
+cleanup() {
+    local exit_code=$?
+    echo "Cleaning up temporary files..."
+    for file in "${CLEANUP_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            rm -f "$file"
+            echo "Removed: $file"
+        fi
+    done
+    exit $exit_code
+}
+
+trap cleanup EXIT
+
+validate_dependencies() {
+    local missing_deps=()
+    
+    if ! command -v psql >/dev/null 2>&1; then
+        missing_deps+=("postgresql-client")
+    fi
+    
+    if ! command -v aws >/dev/null 2>&1; then
+        missing_deps+=("awscli")
+    fi
+    
+    if ! command -v gzip >/dev/null 2>&1; then
+        missing_deps+=("gzip")
+    fi
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing_deps[*]}" >&2
+        echo "Please install the missing packages and try again." >&2
+        exit 1
+    fi
+}
+
+usage() {
+    cat << EOF
+usage: pg_s3_restore [options]
+
+Required:
+  -b, --s3-bucket BUCKET    S3 Bucket to download the backup from
+  -k, --s3-key KEY          S3 Key (filename) of the backup file
+
+Optional:
+  --host HOST               Hostname of the postgres server (default: $HOST)
+  --port PORT               Port of the postgres server (default: $PORT)
+  -d, --dbname DATABASE     Name of the database to restore (default: $DBNAME)
+  -a, --all                 Restore all databases (for pg_dumpall backups)
+  -u, --user USERNAME       Username to connect to the database (default: $USER)
+  -w, --password PASSWORD   Password to connect to the database
+  -s, --s3-prefix PREFIX    S3 Prefix where the backup is located (default: $S3_PREFIX)
+  -r, --aws-profile PROFILE AWS Profile to use for the download (default: $AWS_PROFILE)
+  --drop-if-exists          Drop database if it exists before restore (single DB only)
+  --keep-local              Keep local backup file after restore
+  --temp-dir DIR            Temporary directory for backup files (default: $TEMP_DIR)
+  -h, --help                Show this help message
+
+Examples:
+  $0 --s3-bucket my-backups --s3-key mydb-20231201_143000.sql.gz --dbname mydb
+  $0 --s3-bucket my-backups --s3-key all-20231201_143000.sql --all
+  $0 --s3-bucket my-backups --s3-prefix production/ --s3-key mydb-backup.sql.gz --host db.example.com
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --host)
+            HOST="$2"
+            shift 2
+            ;;
+        --host=*)
+            HOST="${1#*=}"
+            shift
+            ;;
+        --port)
+            PORT="$2"
+            shift 2
+            ;;
+        --port=*)
+            PORT="${1#*=}"
+            shift
+            ;;
+        -d|--dbname)
+            DBNAME="$2"
+            shift 2
+            ;;
+        -d=*|--dbname=*)
+            DBNAME="${1#*=}"
+            shift
+            ;;
+        -a|--all)
+            ALL_DB="true"
+            DBNAME="all"
+            shift
+            ;;
+        -u|--user)
+            USER="$2"
+            shift 2
+            ;;
+        -u=*|--user=*)
+            USER="${1#*=}"
+            shift
+            ;;
+        -w|--password)
+            PASSWORD="$2"
+            shift 2
+            ;;
+        -w=*|--password=*)
+            PASSWORD="${1#*=}"
+            shift
+            ;;
+        -b|--s3-bucket)
+            S3_BUCKET="$2"
+            shift 2
+            ;;
+        -b=*|--s3-bucket=*)
+            S3_BUCKET="${1#*=}"
+            shift
+            ;;
+        -s|--s3-prefix)
+            S3_PREFIX="$2"
+            shift 2
+            ;;
+        -s=*|--s3-prefix=*)
+            S3_PREFIX="${1#*=}"
+            shift
+            ;;
+        -k|--s3-key)
+            S3_KEY="$2"
+            shift 2
+            ;;
+        -k=*|--s3-key=*)
+            S3_KEY="${1#*=}"
+            shift
+            ;;
+        -r|--aws-profile)
+            AWS_PROFILE="$2"
+            shift 2
+            ;;
+        -r=*|--aws-profile=*)
+            AWS_PROFILE="${1#*=}"
+            shift
+            ;;
+        --drop-if-exists)
+            DROP_IF_EXISTS="true"
+            shift
+            ;;
+        --keep-local)
+            KEEP_LOCAL="true"
+            shift
+            ;;
+        --temp-dir)
+            TEMP_DIR="$2"
+            shift 2
+            ;;
+        --temp-dir=*)
+            TEMP_DIR="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+    esac
+done
+
+validate_parameters() {
+    if [[ -z "$S3_BUCKET" ]]; then
+        echo "Error: S3 bucket is required. Use -b or --s3-bucket" >&2
+        exit 1
+    fi
+    
+    if [[ -z "$S3_KEY" ]]; then
+        echo "Error: S3 key (backup filename) is required. Use -k or --s3-key" >&2
+        exit 1
+    fi
+    
+    if [[ ! -d "$TEMP_DIR" ]]; then
+        echo "Error: Temporary directory '$TEMP_DIR' does not exist" >&2
+        exit 1
+    fi
+    
+    if [[ ! -w "$TEMP_DIR" ]]; then
+        echo "Error: Temporary directory '$TEMP_DIR' is not writable" >&2
+        exit 1
+    fi
+    
+    if [[ "$DROP_IF_EXISTS" == "true" && "$ALL_DB" == "true" ]]; then
+        echo "Error: --drop-if-exists cannot be used with --all (cluster restore)" >&2
+        exit 1
+    fi
+}
+
+create_pgpass_file() {
+    if [[ -n "$PASSWORD" ]]; then
+        PGPASS_FILE="$TEMP_DIR/.pgpass.$$"
+        echo "$HOST:$PORT:*:$USER:$PASSWORD" > "$PGPASS_FILE"
+        chmod 600 "$PGPASS_FILE"
+        CLEANUP_FILES+=("$PGPASS_FILE")
+        export PGPASSFILE="$PGPASS_FILE"
+    fi
+}
+
+download_from_s3() {
+    local s3_key="$S3_PREFIX$S3_KEY"
+    
+    if [[ -n "$S3_PREFIX" && ! "$S3_PREFIX" =~ /$ ]]; then
+        s3_key="$S3_PREFIX/$S3_KEY"
+    fi
+    
+    local local_file="$TEMP_DIR/$S3_KEY"
+    CLEANUP_FILES+=("$local_file")
+    
+    echo "Downloading from S3..."
+    echo "Source: s3://$S3_BUCKET/$s3_key"
+    echo "Destination: $local_file"
+    echo "AWS Profile: $AWS_PROFILE"
+    
+    if ! aws s3 cp "s3://$S3_BUCKET/$s3_key" "$local_file" --profile "$AWS_PROFILE"; then
+        echo "Error: S3 download failed" >&2
+        exit 1
+    fi
+    
+    if [[ ! -s "$local_file" ]]; then
+        echo "Error: Downloaded file is empty or was not created" >&2
+        exit 1
+    fi
+    
+    local file_size=$(du -h "$local_file" | cut -f1)
+    echo "Download completed successfully. File size: $file_size"
+    
+    echo "$local_file"
+}
+
+decompress_if_needed() {
+    local file_path="$1"
+    local decompressed_file="$file_path"
+    
+    if [[ "$file_path" == *.gz ]]; then
+        echo "Decompressing backup file..."
+        if ! gzip -d "$file_path"; then
+            echo "Error: Decompression failed" >&2
+            exit 1
+        fi
+        decompressed_file="${file_path%.gz}"
+        CLEANUP_FILES+=("$decompressed_file")
+        local decompressed_size=$(du -h "$decompressed_file" | cut -f1)
+        echo "Decompression completed. Decompressed size: $decompressed_size"
+    fi
+    
+    echo "$decompressed_file"
+}
+
+perform_restore() {
+    local backup_file
+    backup_file=$(download_from_s3)
+    backup_file=$(decompress_if_needed "$backup_file")
+    
+    echo "Starting restore at $(date)"
+    echo "Database: $DBNAME"
+    echo "Host: $HOST:$PORT"
+    echo "User: $USER"
+    echo "Backup file: $backup_file"
+    
+    if [[ "$ALL_DB" == "true" ]]; then
+        echo "Performing full cluster restore (all databases)..."
+        if ! psql -h "$HOST" -p "$PORT" -U "$USER" -d postgres -w -f "$backup_file"; then
+            echo "Error: Cluster restore failed" >&2
+            exit 1
+        fi
+    else
+        echo "Performing single database restore..."
+        
+        if [[ "$DROP_IF_EXISTS" == "true" ]]; then
+            echo "Dropping database '$DBNAME' if it exists..."
+            psql -h "$HOST" -p "$PORT" -U "$USER" -d postgres -w -c "DROP DATABASE IF EXISTS \"$DBNAME\";" || true
+            echo "Creating database '$DBNAME'..."
+            psql -h "$HOST" -p "$PORT" -U "$USER" -d postgres -w -c "CREATE DATABASE \"$DBNAME\";"
+        fi
+        
+        if ! psql -h "$HOST" -p "$PORT" -U "$USER" -d "$DBNAME" -w -f "$backup_file"; then
+            echo "Error: Database restore failed" >&2
+            exit 1
+        fi
+    fi
+    
+    echo "Restore completed successfully"
+    
+    if [[ "$KEEP_LOCAL" == "false" ]]; then
+        echo "Removing local backup files"
+    else
+        echo "Keeping local backup files in: $TEMP_DIR"
+        for i in "${!CLEANUP_FILES[@]}"; do
+            if [[ "${CLEANUP_FILES[i]}" == *"$S3_KEY"* ]]; then
+                unset 'CLEANUP_FILES[i]'
+            fi
+        done
+    fi
+}
+
+main() {
+    validate_dependencies
+    validate_parameters
+    create_pgpass_file
+    perform_restore
+    echo "Restore operation completed successfully at $(date)"
+}
+
+main "$@"
