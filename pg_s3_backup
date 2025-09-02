@@ -15,7 +15,7 @@ PASSWORD=""
 S3_BUCKET=""
 S3_PREFIX=""
 AWS_PROFILE="default"
-COMPRESS="true"
+COMPRESS="false"
 KEEP_LOCAL="false"
 TEMP_DIR="/tmp"
 
@@ -77,7 +77,7 @@ Optional:
   -w, --password PASSWORD   Password to connect to the database
   -s, --s3-prefix PREFIX    S3 Prefix to upload the backup (default: $S3_PREFIX)
   -r, --aws-profile PROFILE AWS Profile to use for the upload (default: $AWS_PROFILE)
-  --no-compress             Disable gzip compression
+  --compress                Enable gzip compression
   --keep-local              Keep local backup file after upload
   --temp-dir DIR            Temporary directory for backup files (default: $TEMP_DIR)
   -h, --help                Show this help message
@@ -160,8 +160,8 @@ while [[ $# -gt 0 ]]; do
             AWS_PROFILE="${1#*=}"
             shift
             ;;
-        --no-compress)
-            COMPRESS="false"
+        --compress)
+            COMPRESS="true"
             shift
             ;;
         --keep-local)
