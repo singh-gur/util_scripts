@@ -35,8 +35,13 @@ EOF
 }
 
 log() {
-    [[ -n "$VERBOSE" ]] && echo "INFO: $1" >&2
+    if [[ -n "$VERBOSE" ]]; then
+        echo "INFO: $1" >&2
+    fi
+    return 0
 }
+
+
 
 error() {
     echo "ERROR: $1" >&2
@@ -44,7 +49,12 @@ error() {
 }
 
 get_monitors() {
-    gnome-monitor-config list | grep "Monitor \[" | sed 's/Monitor \[ \([^ ]*\) \].*/\1/' | sort
+    local monitors
+    monitors=$(gnome-monitor-config list | grep "Monitor \[" | sed 's/Monitor \[ \([^ ]*\) \].*/\1/' | sort)
+    if [[ -z "$monitors" ]]; then
+        error "No monitors found. Make sure monitors are connected and GNOME is running."
+    fi
+    echo "$monitors"
 }
 
 get_monitor_resolutions() {
@@ -135,21 +145,34 @@ get_monitor_best_mode() {
             if (arr[1]) print arr[1]
         }" | head -n1)
     
+    local result
     if [[ -n "$preferred_mode" ]]; then
-        echo "$preferred_mode"
+        result="$preferred_mode"
     else
         # Fall back to first available mode (usually highest)
-        get_monitor_resolutions "$monitor" | head -n1
+        result=$(get_monitor_resolutions "$monitor" | head -n1)
     fi
+    
+    if [[ -z "$result" ]]; then
+        error "No valid mode found for monitor $monitor"
+    fi
+    
+    echo "$result"
 }
 
 execute_or_show() {
     local cmd="$1"
+    if [[ -z "$cmd" ]]; then
+        error "Empty command passed to execute_or_show"
+    fi
+    
     if [[ -n "$DRY_RUN" ]]; then
         echo "Would execute: $cmd"
     else
         log "Executing: $cmd"
-        eval "$cmd"
+        if ! eval "$cmd"; then
+            error "Command failed: $cmd"
+        fi
     fi
 }
 
@@ -238,10 +261,16 @@ configure_extend_all_mode() {
     
     for monitor in "${monitors[@]}"; do
         local best_mode=$(get_monitor_best_mode "$monitor")
+        if [[ -z "$best_mode" ]]; then
+            error "Failed to get best mode for monitor $monitor"
+        fi
         monitor_modes+=("$best_mode")
         
         local resolution=$(echo "$best_mode" | cut -d'@' -f1)
         local width=$(echo "$resolution" | cut -d'x' -f1)
+        if [[ -z "$width" || ! "$width" =~ ^[0-9]+$ ]]; then
+            error "Invalid resolution format from mode $best_mode for monitor $monitor"
+        fi
         monitor_widths+=("$width")
         
         log "Monitor $monitor: optimal mode $best_mode (${resolution})"
