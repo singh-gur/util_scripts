@@ -9,6 +9,7 @@ MODE=""
 RESOLUTION=""
 DRY_RUN=""
 VERBOSE=""
+PRIMARY=""
 
 usage() {
 cat << EOF
@@ -21,6 +22,7 @@ Modes:
 
 Options:
   -r, --resolution RESOLUTION    Override resolution (format: 1920x1080@60)
+  -p, --primary INDEX           Set primary display (extend-all: 0-2, extend-one: 0-1)
   -d, --dry-run                  Show commands without executing them
   -v, --verbose                  Show detailed output
   -h, --help                     Show this help message
@@ -29,6 +31,8 @@ Examples:
   screen_config mirror                           # Mirror all screens at highest common resolution
   screen_config extend-one --resolution=1920x1080@60    # Extend first, mirror others at 1920x1080@60
   screen_config extend-all                       # Extend all screens at highest common resolution
+  screen_config extend-all --primary=1          # Extend all screens, make second monitor primary
+  screen_config extend-one --primary=1          # Extend first, mirror others, make mirrored group primary
   screen_config mirror --dry-run                # Preview mirror configuration without applying
 
 EOF
@@ -227,12 +231,28 @@ configure_extend_one_mode() {
     log "First monitor mode: $first_mode"
     
     local cmd="gnome-monitor-config set"
-    cmd="$cmd -L -p -M ${monitors[0]} -m $first_mode"
+    local primary_index=0
+    if [[ -n "$PRIMARY" ]]; then
+        primary_index="$PRIMARY"
+    fi
+    
+    # Add first monitor (extended)
+    local first_primary_flag=""
+    if [[ $primary_index -eq 0 ]]; then
+        first_primary_flag="-p"
+    fi
+    cmd="$cmd -L $first_primary_flag -M ${monitors[0]} -m $first_mode"
     
     # Calculate x position based on first monitor resolution
     local resolution=$(echo "$first_mode" | cut -d'@' -f1)
     local width=$(echo "$resolution" | cut -d'x' -f1)
-    cmd="$cmd -L -x $width -y 0"
+    
+    # Add mirrored group
+    local mirror_primary_flag=""
+    if [[ $primary_index -eq 1 ]]; then
+        mirror_primary_flag="-p"
+    fi
+    cmd="$cmd -L -x $width -y 0 $mirror_primary_flag"
     
     for monitor in "${monitors[@]:1}"; do
         cmd="$cmd -M $monitor -m $mode"
@@ -277,12 +297,17 @@ configure_extend_all_mode() {
     done
     
     # Build command with individual positioning
+    local primary_index=0
+    if [[ -n "$PRIMARY" ]]; then
+        primary_index="$PRIMARY"
+    fi
+    
     for i in "${!monitors[@]}"; do
         local monitor="${monitors[$i]}"
         local mode="${monitor_modes[$i]}"
         local primary_flag=""
         
-        if [[ $i -eq 0 ]]; then
+        if [[ $i -eq $primary_index ]]; then
             primary_flag="-p"
         fi
         
@@ -304,12 +329,16 @@ configure_extend_all_mode_common_resolution() {
     local width=$(echo "$resolution" | cut -d'x' -f1)
     
     local cmd="gnome-monitor-config set"
+    local primary_index=0
+    if [[ -n "$PRIMARY" ]]; then
+        primary_index="$PRIMARY"
+    fi
     
     for i in "${!monitors[@]}"; do
         local monitor="${monitors[$i]}"
         local primary_flag=""
         
-        if [[ $i -eq 0 ]]; then
+        if [[ $i -eq $primary_index ]]; then
             primary_flag="-p"
         fi
         
@@ -334,6 +363,36 @@ validate_monitors() {
     done
     
     log "Validated 3 monitors: ${monitors[*]}"
+}
+
+validate_primary_flag() {
+    if [[ -z "$PRIMARY" ]]; then
+        return 0  # No primary flag specified, use defaults
+    fi
+    
+    # Validate it's a number
+    if ! [[ "$PRIMARY" =~ ^[0-9]+$ ]]; then
+        error "Primary flag must be a number, got: $PRIMARY"
+    fi
+    
+    # Validate range based on mode
+    case "$MODE" in
+        extend-all)
+            if [[ $PRIMARY -lt 0 || $PRIMARY -gt 2 ]]; then
+                error "Primary flag for extend-all mode must be 0, 1, or 2, got: $PRIMARY"
+            fi
+            ;;
+        extend-one)
+            if [[ $PRIMARY -lt 0 || $PRIMARY -gt 1 ]]; then
+                error "Primary flag for extend-one mode must be 0 or 1, got: $PRIMARY"
+            fi
+            ;;
+        mirror)
+            error "Primary flag is not supported for mirror mode"
+            ;;
+    esac
+    
+    log "Primary display validation passed: $PRIMARY"
 }
 
 parse_arguments() {
@@ -369,6 +428,14 @@ parse_arguments() {
                     shift
                 fi
                 log "Resolution override: $RESOLUTION"
+                ;;
+            -p|--primary)
+                PRIMARY=$(echo "$VALUE" | tr -d '"')
+                if [[ -z "$PRIMARY" && -n "$2" && ! "$2" =~ ^- ]]; then
+                    PRIMARY="$2"
+                    shift
+                fi
+                log "Primary display index: $PRIMARY"
                 ;;
             -d|--dry-run)
                 DRY_RUN="Y"
@@ -408,6 +475,7 @@ main() {
     
     log "Found monitors: ${monitors[*]}"
     validate_monitors "${monitors[@]}"
+    validate_primary_flag
     
     case "$MODE" in
         mirror)
