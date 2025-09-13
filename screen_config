@@ -123,6 +123,26 @@ get_best_refresh_rate() {
     get_monitor_resolutions "$monitor" | grep "^$resolution@" | head -n1
 }
 
+get_monitor_best_mode() {
+    local monitor=$1
+    
+    # First try to get PREFERRED or CURRENT mode
+    local preferred_mode=$(gnome-monitor-config list | awk "
+        /Monitor \[ $monitor \]/ {found=1; next}
+        /Monitor \[/ && found {exit}
+        found && /PREFERRED|CURRENT/ {
+            match(\$0, /\\[id: '([^']+)'\\]/, arr)
+            if (arr[1]) print arr[1]
+        }" | head -n1)
+    
+    if [[ -n "$preferred_mode" ]]; then
+        echo "$preferred_mode"
+    else
+        # Fall back to first available mode (usually highest)
+        get_monitor_resolutions "$monitor" | head -n1
+    fi
+}
+
 execute_or_show() {
     local cmd="$1"
     if [[ -n "$DRY_RUN" ]]; then
@@ -200,16 +220,55 @@ configure_extend_one_mode() {
 
 configure_extend_all_mode() {
     local monitors=("$@")
-    local mode="$RESOLUTION"
     
-    if [[ -z "$mode" ]]; then
-        mode=$(find_highest_common_resolution "${monitors[@]}")
-        log "Auto-detected common mode: $mode"
-    else
-        log "Using specified mode: $mode"
+    if [[ -n "$RESOLUTION" ]]; then
+        log "Using specified resolution for all monitors: $RESOLUTION"
+        configure_extend_all_mode_common_resolution "${monitors[@]}"
+        return
     fi
     
-    log "Configuring extend-all mode with mode: $mode"
+    log "Configuring extend-all mode with optimal resolution per monitor"
+    
+    local cmd="gnome-monitor-config set"
+    local x_offset=0
+    
+    # Get optimal mode for each monitor
+    local monitor_modes=()
+    local monitor_widths=()
+    
+    for monitor in "${monitors[@]}"; do
+        local best_mode=$(get_monitor_best_mode "$monitor")
+        monitor_modes+=("$best_mode")
+        
+        local resolution=$(echo "$best_mode" | cut -d'@' -f1)
+        local width=$(echo "$resolution" | cut -d'x' -f1)
+        monitor_widths+=("$width")
+        
+        log "Monitor $monitor: optimal mode $best_mode (${resolution})"
+    done
+    
+    # Build command with individual positioning
+    for i in "${!monitors[@]}"; do
+        local monitor="${monitors[$i]}"
+        local mode="${monitor_modes[$i]}"
+        local primary_flag=""
+        
+        if [[ $i -eq 0 ]]; then
+            primary_flag="-p"
+        fi
+        
+        cmd="$cmd -L -x $x_offset -y 0 $primary_flag -M $monitor -m $mode"
+        x_offset=$((x_offset + ${monitor_widths[$i]}))
+    done
+    
+    execute_or_show "$cmd"
+}
+
+configure_extend_all_mode_common_resolution() {
+    local monitors=("$@")
+    local mode="$RESOLUTION"
+    
+    log "Configuring extend-all mode with common resolution: $mode"
     
     local x_offset=0
     local resolution=$(echo "$mode" | cut -d'@' -f1)
