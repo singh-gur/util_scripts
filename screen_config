@@ -1,0 +1,343 @@
+#!/bin/bash
+
+set -e
+set +v
+
+echo "Configuring 3-screen setup for GNOME"
+
+MODE=""
+RESOLUTION=""
+DRY_RUN=""
+VERBOSE=""
+
+usage() {
+cat << EOF
+usage: screen_config <mode> [options]
+
+Modes:
+  mirror            Mirror all 3 screens (uses highest common resolution)
+  extend-one        Extend first screen, mirror other two
+  extend-all        Extend all screens side by side
+
+Options:
+  -r, --resolution RESOLUTION    Override resolution (format: 1920x1080@60)
+  -d, --dry-run                  Show commands without executing them
+  -v, --verbose                  Show detailed output
+  -h, --help                     Show this help message
+
+Examples:
+  screen_config mirror                           # Mirror all screens at highest common resolution
+  screen_config extend-one --resolution=1920x1080@60    # Extend first, mirror others at 1920x1080@60
+  screen_config extend-all                       # Extend all screens at highest common resolution
+  screen_config mirror --dry-run                # Preview mirror configuration without applying
+
+EOF
+}
+
+log() {
+    [[ -n "$VERBOSE" ]] && echo "INFO: $1" >&2
+}
+
+error() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+get_monitors() {
+    gnome-monitor-config list | grep "Monitor \[" | sed 's/Monitor \[ \([^ ]*\) \].*/\1/' | sort
+}
+
+get_monitor_resolutions() {
+    local monitor=$1
+    gnome-monitor-config list | awk "
+        /Monitor \[ $monitor \]/ {found=1; next}
+        /Monitor \[/ && found {exit}
+        found && /^  [0-9]/ && !/display-name:/ {
+            match(\$0, /\\[id: '([^']+)'\\]/, arr)
+            if (arr[1]) print arr[1]
+        }"
+}
+
+find_highest_common_resolution() {
+    local monitors=("$@")
+    local common_mode=""
+    local max_pixels=0
+    
+    log "Finding highest common mode among monitors: ${monitors[*]}"
+    
+    # Get all unique resolutions (without @refresh) from all monitors
+    local all_resolutions
+    mapfile -t all_resolutions < <(
+        for monitor in "${monitors[@]}"; do
+            get_monitor_resolutions "$monitor" | cut -d'@' -f1
+        done | sort -u
+    )
+    
+    # For each resolution, find the best common mode
+    for resolution in "${all_resolutions[@]}"; do
+        local width height pixels
+        IFS='x' read -r width height <<< "$resolution"
+        pixels=$((width * height))
+        
+        # Find a mode for this resolution that all monitors support
+        local common_mode_for_resolution=""
+        local first_monitor=${monitors[0]}
+        local candidate_modes
+        mapfile -t candidate_modes < <(get_monitor_resolutions "$first_monitor" | grep "^$resolution@")
+        
+        for candidate_mode in "${candidate_modes[@]}"; do
+            local available_on_all=true
+            
+            for monitor in "${monitors[@]:1}"; do
+                if ! get_monitor_resolutions "$monitor" | grep -q "^$candidate_mode$"; then
+                    available_on_all=false
+                    break
+                fi
+            done
+            
+            if [[ "$available_on_all" == true ]]; then
+                common_mode_for_resolution="$candidate_mode"
+                break
+            fi
+        done
+        
+        # If we found a common mode for this resolution and it's better than current best
+        if [[ -n "$common_mode_for_resolution" && $pixels -gt $max_pixels ]]; then
+            max_pixels=$pixels
+            common_mode="$common_mode_for_resolution"
+        fi
+    done
+    
+    if [[ -z "$common_mode" ]]; then
+        error "No common mode found among all monitors"
+    fi
+    
+    log "Best common mode found: $common_mode"
+    echo "$common_mode"
+}
+
+get_best_refresh_rate() {
+    local monitor=$1
+    local resolution=$2
+    
+    get_monitor_resolutions "$monitor" | grep "^$resolution@" | head -n1
+}
+
+execute_or_show() {
+    local cmd="$1"
+    if [[ -n "$DRY_RUN" ]]; then
+        echo "Would execute: $cmd"
+    else
+        log "Executing: $cmd"
+        eval "$cmd"
+    fi
+}
+
+configure_mirror_mode() {
+    local monitors=("$@")
+    local mode="$RESOLUTION"
+    
+    if [[ -z "$mode" ]]; then
+        mode=$(find_highest_common_resolution "${monitors[@]}")
+        log "Auto-detected common mode: $mode"
+    else
+        log "Using specified mode: $mode"
+    fi
+    
+    log "Configuring mirror mode with mode: $mode"
+    
+    local cmd="gnome-monitor-config set -L -p"
+    
+    for monitor in "${monitors[@]}"; do
+        cmd="$cmd -M $monitor -m $mode"
+    done
+    
+    execute_or_show "$cmd"
+}
+
+configure_extend_one_mode() {
+    local monitors=("$@")
+    local mode="$RESOLUTION"
+    
+    if [[ -z "$mode" ]]; then
+        mode=$(find_highest_common_resolution "${monitors[@]:1}")
+        log "Auto-detected common mode for mirrors: $mode"
+    else
+        log "Using specified mode: $mode"
+    fi
+    
+    log "Configuring extend-one mode"
+    log "First monitor (${monitors[0]}) will be extended"
+    log "Other monitors will mirror at: $mode"
+    
+    local first_mode
+    if [[ -n "$RESOLUTION" ]]; then
+        first_mode="$RESOLUTION"
+    else
+        local first_res=$(get_monitor_resolutions "${monitors[0]}" | grep 'PREFERRED\|CURRENT' | head -n1)
+        if [[ -z "$first_res" ]]; then
+            first_res=$(get_monitor_resolutions "${monitors[0]}" | head -n1)
+        fi
+        first_mode="$first_res"
+    fi
+    
+    log "First monitor mode: $first_mode"
+    
+    local cmd="gnome-monitor-config set"
+    cmd="$cmd -L -p -M ${monitors[0]} -m $first_mode"
+    
+    # Calculate x position based on first monitor resolution
+    local resolution=$(echo "$first_mode" | cut -d'@' -f1)
+    local width=$(echo "$resolution" | cut -d'x' -f1)
+    cmd="$cmd -L -x $width -y 0"
+    
+    for monitor in "${monitors[@]:1}"; do
+        cmd="$cmd -M $monitor -m $mode"
+    done
+    
+    execute_or_show "$cmd"
+}
+
+configure_extend_all_mode() {
+    local monitors=("$@")
+    local mode="$RESOLUTION"
+    
+    if [[ -z "$mode" ]]; then
+        mode=$(find_highest_common_resolution "${monitors[@]}")
+        log "Auto-detected common mode: $mode"
+    else
+        log "Using specified mode: $mode"
+    fi
+    
+    log "Configuring extend-all mode with mode: $mode"
+    
+    local x_offset=0
+    local resolution=$(echo "$mode" | cut -d'@' -f1)
+    local width=$(echo "$resolution" | cut -d'x' -f1)
+    
+    local cmd="gnome-monitor-config set"
+    
+    for i in "${!monitors[@]}"; do
+        local monitor="${monitors[$i]}"
+        local primary_flag=""
+        
+        if [[ $i -eq 0 ]]; then
+            primary_flag="-p"
+        fi
+        
+        cmd="$cmd -L -x $x_offset -y 0 $primary_flag -M $monitor -m $mode"
+        x_offset=$((x_offset + width))
+    done
+    
+    execute_or_show "$cmd"
+}
+
+validate_monitors() {
+    local monitors=("$@")
+    
+    if [[ ${#monitors[@]} -ne 3 ]]; then
+        error "Expected exactly 3 monitors, found ${#monitors[@]}: ${monitors[*]}"
+    fi
+    
+    for monitor in "${monitors[@]}"; do
+        if ! gnome-monitor-config list | grep -q "Monitor \[ $monitor \]"; then
+            error "Monitor $monitor is not available or not connected"
+        fi
+    done
+    
+    log "Validated 3 monitors: ${monitors[*]}"
+}
+
+parse_arguments() {
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+    
+    MODE="$1"
+    shift
+    
+    case "$MODE" in
+        mirror|extend-one|extend-all)
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            error "Invalid mode: $MODE. Use 'mirror', 'extend-one', 'extend-all', or --help"
+            ;;
+    esac
+    
+    while [[ $# -gt 0 ]]; do
+        PARAM=$(echo "$1" | awk -F= '{print $1}')
+        VALUE=$(echo "$1" | awk -F= '{print $2}')
+        
+        case $PARAM in
+            -r|--resolution)
+                RESOLUTION=$(echo "$VALUE" | tr -d '"')
+                if [[ -z "$RESOLUTION" && -n "$2" && ! "$2" =~ ^- ]]; then
+                    RESOLUTION="$2"
+                    shift
+                fi
+                log "Resolution override: $RESOLUTION"
+                ;;
+            -d|--dry-run)
+                DRY_RUN="Y"
+                [[ -n "$VERBOSE" ]] && echo "INFO: Dry run mode enabled" >&2
+                ;;
+            -v|--verbose)
+                VERBOSE="Y"
+                echo "INFO: Verbose mode enabled" >&2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $PARAM"
+                ;;
+        esac
+        shift
+    done
+    
+    log "Mode selected: $MODE"
+}
+
+check_dependencies() {
+    if ! command -v gnome-monitor-config &> /dev/null; then
+        error "gnome-monitor-config is not available. Make sure you're running GNOME desktop environment."
+    fi
+}
+
+main() {
+    parse_arguments "$@"
+    check_dependencies
+    
+    log "Getting monitor list..."
+    local monitors
+    mapfile -t monitors < <(get_monitors)
+    
+    log "Found monitors: ${monitors[*]}"
+    validate_monitors "${monitors[@]}"
+    
+    case "$MODE" in
+        mirror)
+            configure_mirror_mode "${monitors[@]}"
+            ;;
+        extend-one)
+            configure_extend_one_mode "${monitors[@]}"
+            ;;
+        extend-all)
+            configure_extend_all_mode "${monitors[@]}"
+            ;;
+    esac
+    
+    if [[ -z "$DRY_RUN" ]]; then
+        echo "Screen configuration applied successfully!"
+        echo "Current configuration:"
+        gnome-monitor-config list | grep -E "(Logical monitor|Monitor.*ON)" | head -10
+    fi
+}
+
+main "$@"
