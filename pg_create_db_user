@@ -25,6 +25,7 @@ usage() {
     echo "  --host=<host>        PostgreSQL host (default: localhost)"
     echo "  --port=<port>        PostgreSQL port (default: 5432)"
     echo "  --admin-user=<user>  Admin user for connection (default: postgres)"
+    echo "  --test-only          Only test existence checks, don't create anything"
     echo "  --help, -h           Show this help message"
     echo ""
     echo "Permission levels:"
@@ -66,6 +67,7 @@ PERMISSION_LEVEL="$DEFAULT_PERMISSION_LEVEL"
 HOST="$DEFAULT_HOST"
 PORT="$DEFAULT_PORT"
 ADMIN_USER="$DEFAULT_ADMIN_USER"
+TEST_ONLY=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -96,6 +98,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --admin-user=*)
             ADMIN_USER="${1#*=}"
+            shift
+            ;;
+        --test-only)
+            TEST_ONLY=true
             shift
             ;;
         --help|-h)
@@ -161,8 +167,15 @@ execute_sql_with_output() {
     local sql="$1"
     local description="$2"
     
-    echo "Checking: $description"
-    psql "$ADMIN_CONN" -t -c "$sql" 2>/dev/null || echo "f"
+    echo "Checking: $description" >&2  # Send to stderr so it doesn't interfere with return value
+    local result
+    if result=$(psql "$ADMIN_CONN" -t -A -c "$sql" 2>/dev/null); then
+        # Clean up whitespace and return the result
+        result=$(echo "$result" | tr -d ' \t\n\r')
+        echo "$result"
+    else
+        echo "f"
+    fi
 }
 
 # Check if database exists
@@ -171,8 +184,18 @@ DB_EXISTS=$(execute_sql_with_output "SELECT EXISTS(SELECT 1 FROM pg_database WHE
 # Check if user exists
 USER_EXISTS=$(execute_sql_with_output "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = '$USER_NAME');" "user existence")
 
+# If test-only mode, exit here
+if [ "$TEST_ONLY" = true ]; then
+    echo ""
+    echo "=== TEST MODE RESULTS ==="
+    echo "Database '$DB_NAME' exists: $DB_EXISTS"
+    echo "User '$USER_NAME' exists: $USER_EXISTS"
+    echo "========================="
+    exit 0
+fi
+
 # Create user if it doesn't exist
-if [[ "$USER_EXISTS" =~ "t" ]]; then
+if [ "$USER_EXISTS" = "t" ]; then
     echo "User $USER_NAME already exists, updating password..."
     execute_sql "ALTER USER \"$USER_NAME\" WITH PASSWORD '$PASSWORD' LOGIN;" "password update"
 else
@@ -181,7 +204,7 @@ else
 fi
 
 # Create database if it doesn't exist
-if [[ "$DB_EXISTS" =~ "t" ]]; then
+if [ "$DB_EXISTS" = "t" ]; then
     echo "Database $DB_NAME already exists, updating ownership..."
     execute_sql "ALTER DATABASE \"$DB_NAME\" OWNER TO \"$USER_NAME\";" "database ownership update"
 else
