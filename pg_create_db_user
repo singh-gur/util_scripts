@@ -1,0 +1,190 @@
+#!/bin/bash
+
+# PostgreSQL Database and User Creation Script
+# This script creates a database with an owner user and configurable permissions
+# Usage: ./create-database-user.sh <db_name> <user_name> <password> [permission_level] [host] [port] [admin_user]
+
+set -e  # Exit on any error
+
+# Default values
+DEFAULT_PERMISSION_LEVEL="standard"
+DEFAULT_HOST="localhost"
+DEFAULT_PORT="5432"
+DEFAULT_ADMIN_USER="postgres"
+
+# Function to display usage
+usage() {
+    echo "Usage: $0 <db_name> <user_name> <password> [permission_level] [host] [port] [admin_user]"
+    echo ""
+    echo "Parameters:"
+    echo "  db_name          - Name of the database to create (required)"
+    echo "  user_name        - Name of the user to create (required)"
+    echo "  password         - Password for the user (required)"
+    echo "  permission_level - Permission level: minimal, standard, full (default: standard)"
+    echo "  host            - PostgreSQL host (default: localhost)"
+    echo "  port            - PostgreSQL port (default: 5432)"
+    echo "  admin_user      - Admin user for connection (default: postgres)"
+    echo ""
+    echo "Permission levels:"
+    echo "  minimal  - USAGE on schema only"
+    echo "  standard - CRUD operations on tables and sequences"
+    echo "  full     - ALL PRIVILEGES on all objects"
+    echo ""
+    echo "Examples:"
+    echo "  $0 myapp_db myapp_user SecurePass123"
+    echo "  $0 myapp_db myapp_user SecurePass123 full"
+    echo "  $0 myapp_db myapp_user SecurePass123 standard localhost 5432 postgres"
+    exit 1
+}
+
+# Function to validate input
+validate_input() {
+    local name="$1"
+    local type="$2"
+    
+    if [[ ! "$name" =~ ^[a-zA-Z][a-zA-Z0-9_]*$ ]]; then
+        echo "Error: $type name must start with a letter and contain only letters, numbers, and underscores"
+        exit 1
+    fi
+}
+
+# Function to check if command exists
+check_command() {
+    if ! command -v "$1" &> /dev/null; then
+        echo "Error: $1 is not installed or not in PATH"
+        exit 1
+    fi
+}
+
+# Parse arguments
+if [ $# -lt 3 ]; then
+    echo "Error: Missing required parameters"
+    usage
+fi
+
+DB_NAME="$1"
+USER_NAME="$2"
+PASSWORD="$3"
+PERMISSION_LEVEL="${4:-$DEFAULT_PERMISSION_LEVEL}"
+HOST="${5:-$DEFAULT_HOST}"
+PORT="${6:-$DEFAULT_PORT}"
+ADMIN_USER="${7:-$DEFAULT_ADMIN_USER}"
+
+# Validate inputs
+validate_input "$DB_NAME" "Database"
+validate_input "$USER_NAME" "User"
+
+if [ ${#PASSWORD} -lt 8 ]; then
+    echo "Error: Password must be at least 8 characters long"
+    exit 1
+fi
+
+if [[ ! "$PERMISSION_LEVEL" =~ ^(minimal|standard|full)$ ]]; then
+    echo "Error: Permission level must be one of: minimal, standard, full"
+    exit 1
+fi
+
+# Check if psql is available
+check_command "psql"
+
+echo "Creating database setup with the following parameters:"
+echo "Database name: $DB_NAME"
+echo "User name: $USER_NAME"
+echo "Permission level: $PERMISSION_LEVEL"
+echo "Host: $HOST"
+echo "Port: $PORT"
+echo "Admin user: $ADMIN_USER"
+echo ""
+
+# Connection string for admin operations
+ADMIN_CONN="postgresql://$ADMIN_USER@$HOST:$PORT/postgres"
+
+# Function to execute SQL with error handling
+execute_sql() {
+    local sql="$1"
+    local description="$2"
+    
+    echo "Executing: $description"
+    if ! psql "$ADMIN_CONN" -c "$sql" > /dev/null 2>&1; then
+        echo "Warning: $description may have failed or object already exists"
+    fi
+}
+
+# Function to execute SQL and capture result
+execute_sql_with_output() {
+    local sql="$1"
+    local description="$2"
+    
+    echo "Checking: $description"
+    psql "$ADMIN_CONN" -t -c "$sql" 2>/dev/null || echo "f"
+}
+
+# Check if database exists
+DB_EXISTS=$(execute_sql_with_output "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = '$DB_NAME');" "database existence")
+
+# Check if user exists
+USER_EXISTS=$(execute_sql_with_output "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = '$USER_NAME');" "user existence")
+
+# Create user if it doesn't exist
+if [[ "$USER_EXISTS" =~ "t" ]]; then
+    echo "User $USER_NAME already exists, updating password..."
+    execute_sql "ALTER USER \"$USER_NAME\" WITH PASSWORD '$PASSWORD' LOGIN;" "password update"
+else
+    echo "Creating user $USER_NAME..."
+    execute_sql "CREATE USER \"$USER_NAME\" WITH PASSWORD '$PASSWORD' LOGIN;" "user creation"
+fi
+
+# Create database if it doesn't exist
+if [[ "$DB_EXISTS" =~ "t" ]]; then
+    echo "Database $DB_NAME already exists, updating ownership..."
+    execute_sql "ALTER DATABASE \"$DB_NAME\" OWNER TO \"$USER_NAME\";" "database ownership update"
+else
+    echo "Creating database $DB_NAME..."
+    execute_sql "CREATE DATABASE \"$DB_NAME\" WITH OWNER \"$USER_NAME\" ENCODING 'UTF8';" "database creation"
+fi
+
+# Grant database-level permissions
+execute_sql "GRANT CONNECT ON DATABASE \"$DB_NAME\" TO \"$USER_NAME\";" "database connect permission"
+
+# Connect to the new database for schema permissions
+DB_CONN="postgresql://$ADMIN_USER@$HOST:$PORT/$DB_NAME"
+
+echo "Setting up $PERMISSION_LEVEL permissions..."
+
+case "$PERMISSION_LEVEL" in
+    "minimal")
+        psql "$DB_CONN" -c "GRANT USAGE ON SCHEMA public TO \"$USER_NAME\";" > /dev/null
+        echo "Applied minimal permissions (USAGE on schema)"
+        ;;
+    "standard")
+        psql "$DB_CONN" -c "GRANT USAGE, CREATE ON SCHEMA public TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO \"$USER_NAME\";" > /dev/null
+        echo "Applied standard permissions (CRUD operations)"
+        ;;
+    "full")
+        psql "$DB_CONN" -c "GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "GRANT ALL PRIVILEGES ON SCHEMA public TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO \"$USER_NAME\";" > /dev/null
+        psql "$DB_CONN" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO \"$USER_NAME\";" > /dev/null
+        echo "Applied full permissions (ALL PRIVILEGES)"
+        ;;
+esac
+
+echo ""
+echo "✅ Database setup completed successfully!"
+echo "Database: $DB_NAME"
+echo "User: $USER_NAME"
+echo "Permission level: $PERMISSION_LEVEL"
+echo ""
+echo "You can now connect to the database using:"
+echo "psql postgresql://$USER_NAME@$HOST:$PORT/$DB_NAME"
+echo ""
+echo "Or using separate parameters:"
+echo "psql -h $HOST -p $PORT -U $USER_NAME -d $DB_NAME"
