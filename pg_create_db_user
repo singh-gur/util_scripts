@@ -2,7 +2,6 @@
 
 # PostgreSQL Database and User Creation Script
 # This script creates a database with an owner user and configurable permissions
-# Usage: ./create-database-user.sh <db_name> <user_name> <password> [permission_level] [host] [port] [admin_user]
 
 set -e  # Exit on any error
 
@@ -14,16 +13,19 @@ DEFAULT_ADMIN_USER="postgres"
 
 # Function to display usage
 usage() {
-    echo "Usage: $0 <db_name> <user_name> <password> [permission_level] [host] [port] [admin_user]"
+    echo "Usage: $0 --dbname=<db_name> --username=<user_name> --password=<password> [options]"
     echo ""
-    echo "Parameters:"
-    echo "  db_name          - Name of the database to create (required)"
-    echo "  user_name        - Name of the user to create (required)"
-    echo "  password         - Password for the user (required)"
-    echo "  permission_level - Permission level: minimal, standard, full (default: standard)"
-    echo "  host            - PostgreSQL host (default: localhost)"
-    echo "  port            - PostgreSQL port (default: 5432)"
-    echo "  admin_user      - Admin user for connection (default: postgres)"
+    echo "Required parameters:"
+    echo "  --dbname=<name>      Name of the database to create"
+    echo "  --username=<name>    Name of the user to create"
+    echo "  --password=<pass>    Password for the user"
+    echo ""
+    echo "Optional parameters:"
+    echo "  --permission=<level> Permission level: minimal, standard, full (default: standard)"
+    echo "  --host=<host>        PostgreSQL host (default: localhost)"
+    echo "  --port=<port>        PostgreSQL port (default: 5432)"
+    echo "  --admin-user=<user>  Admin user for connection (default: postgres)"
+    echo "  --help, -h           Show this help message"
     echo ""
     echo "Permission levels:"
     echo "  minimal  - USAGE on schema only"
@@ -31,9 +33,9 @@ usage() {
     echo "  full     - ALL PRIVILEGES on all objects"
     echo ""
     echo "Examples:"
-    echo "  $0 myapp_db myapp_user SecurePass123"
-    echo "  $0 myapp_db myapp_user SecurePass123 full"
-    echo "  $0 myapp_db myapp_user SecurePass123 standard localhost 5432 postgres"
+    echo "  $0 --dbname=myapp_db --username=myapp_user --password=SecurePass123"
+    echo "  $0 --dbname=myapp_db --username=myapp_user --password=SecurePass123 --permission=full"
+    echo "  $0 --dbname=myapp_db --username=myapp_user --password=SecurePass123 --host=localhost --port=5432"
     exit 1
 }
 
@@ -56,19 +58,63 @@ check_command() {
     fi
 }
 
+# Initialize variables
+DB_NAME=""
+USER_NAME=""
+PASSWORD=""
+PERMISSION_LEVEL="$DEFAULT_PERMISSION_LEVEL"
+HOST="$DEFAULT_HOST"
+PORT="$DEFAULT_PORT"
+ADMIN_USER="$DEFAULT_ADMIN_USER"
+
 # Parse arguments
-if [ $# -lt 3 ]; then
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dbname=*)
+            DB_NAME="${1#*=}"
+            shift
+            ;;
+        --username=*)
+            USER_NAME="${1#*=}"
+            shift
+            ;;
+        --password=*)
+            PASSWORD="${1#*=}"
+            shift
+            ;;
+        --permission=*)
+            PERMISSION_LEVEL="${1#*=}"
+            shift
+            ;;
+        --host=*)
+            HOST="${1#*=}"
+            shift
+            ;;
+        --port=*)
+            PORT="${1#*=}"
+            shift
+            ;;
+        --admin-user=*)
+            ADMIN_USER="${1#*=}"
+            shift
+            ;;
+        --help|-h)
+            usage
+            ;;
+        *)
+            echo "Error: Unknown parameter $1"
+            usage
+            ;;
+    esac
+done
+
+# Check required parameters
+if [ -z "$DB_NAME" ] || [ -z "$USER_NAME" ] || [ -z "$PASSWORD" ]; then
     echo "Error: Missing required parameters"
+    echo "Required: --dbname, --username, --password"
+    echo ""
     usage
 fi
-
-DB_NAME="$1"
-USER_NAME="$2"
-PASSWORD="$3"
-PERMISSION_LEVEL="${4:-$DEFAULT_PERMISSION_LEVEL}"
-HOST="${5:-$DEFAULT_HOST}"
-PORT="${6:-$DEFAULT_PORT}"
-ADMIN_USER="${7:-$DEFAULT_ADMIN_USER}"
 
 # Validate inputs
 validate_input "$DB_NAME" "Database"
