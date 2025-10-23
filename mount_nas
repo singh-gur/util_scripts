@@ -8,61 +8,89 @@ echo "Mounting NFS4 directory from NAS server"
 
 # Default values
 NAS_IP="192.168.2.119"
-SOURCE_PATH="/mnt/ssd_data"
-TARGET_PATH="$HOME/nas_mounts"
+SOURCE_BASE="/mnt/ssd_data"
+TARGET_BASE="$HOME/nas_mounts"
+SUBDIR=""
 FORCE=""
 VERBOSE=""
 
 usage()
 {
 cat << eof
-usage: mount_nas <options>
+usage: mount_nas <options> [subdirectory]
     -s, --server       NAS server IP address (default: 192.168.2.119)
-    --source           Source path on NAS server (default: /mnt/ssd_data)
-    -t, --target       Target mount directory (default: ~/nas_mounts)
+    --source-base      Source base path on NAS server (default: /mnt/ssd_data)
+    -t, --target-base  Target base mount directory (default: ~/nas_mounts)
     -f, --force        Force remount if already mounted
     -v, --verbose      Verbose output
     -h, --help         Get usage info
 
+Arguments:
+    subdirectory       Optional subdirectory to mount under base paths
+
 Examples:
-    mount_nas                                    # Mount with defaults
-    mount_nas --server=192.168.1.100            # Use different NAS IP
-    mount_nas --source=/data --target=/mnt/data # Custom paths
-    mount_nas --force --verbose                 # Force remount with verbose output
+    mount_nas                                    # Mount base paths (192.168.2.119:/mnt/ssd_data -> ~/nas_mounts)
+    mount_nas documents                          # Mount 192.168.2.119:/mnt/ssd_data/documents -> ~/nas_mounts/documents
+    mount_nas --server=192.168.1.100 photos     # Mount 192.168.1.100:/mnt/ssd_data/photos -> ~/nas_mounts/photos
+    mount_nas --source-base=/data --target-base=/mnt/data backups  # Mount /data/backups -> /mnt/data/backups
+    mount_nas --force --verbose media            # Force remount media directory with verbose output
 eof
 }
 
-while [ "$1" != "" ]; do
-    PARAM=`echo $1 | awk -F= '{print $1}'`
-    VALUE=`echo $1 | awk -F= '{print $2}'`
-    case $PARAM in
-        -s | --server )
-            NAS_IP=$(echo $VALUE | tr -d '"')
-        ;;
-        --source )
-            SOURCE_PATH=$(echo $VALUE | tr -d '"')
-        ;;
-        -t | --target )
-            TARGET_PATH=$(echo $VALUE | tr -d '"')
-        ;;
-        -f | --force )
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -s|--server)
+            NAS_IP="$2"
+            shift 2
+            ;;
+        --source-base)
+            SOURCE_BASE="$2"
+            shift 2
+            ;;
+        -t|--target-base)
+            TARGET_BASE="$2"
+            shift 2
+            ;;
+        -f|--force)
             FORCE="Y"
-        ;;
-        -v | --verbose )
+            shift
+            ;;
+        -v|--verbose)
             VERBOSE="Y"
-        ;;
-        -h | --help )
+            shift
+            ;;
+        -h|--help)
             usage
             exit 0
-        ;;
-        *)
+            ;;
+        -*|--*)
             echo "Unknown option $1"
             echo "Use -h or --help for usage information"
             exit 1
-        ;;
+            ;;
+        *)
+            # Positional argument - subdirectory
+            if [ -z "$SUBDIR" ]; then
+                SUBDIR="$1"
+            else
+                echo "Error: Multiple subdirectories specified"
+                echo "Use -h or --help for usage information"
+                exit 1
+            fi
+            shift
+            ;;
     esac
-    shift
 done
+
+# Construct full paths
+if [ -n "$SUBDIR" ]; then
+    SOURCE_PATH="${SOURCE_BASE%/}/${SUBDIR}"
+    TARGET_PATH="${TARGET_BASE%/}/${SUBDIR}"
+else
+    SOURCE_PATH="$SOURCE_BASE"
+    TARGET_PATH="$TARGET_BASE"
+fi
 
 # Validate NAS IP format
 if ! [[ $NAS_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
@@ -70,8 +98,17 @@ if ! [[ $NAS_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
     exit 1
 fi
 
-# Expand ~ in target path
-TARGET_PATH="${TARGET_PATH/#\~/$HOME}"
+# Expand ~ in target base path before constructing full path
+TARGET_BASE="${TARGET_BASE/#\~/$HOME}"
+
+# Reconstruct full paths with expanded home directory
+if [ -n "$SUBDIR" ]; then
+    SOURCE_PATH="${SOURCE_BASE%/}/${SUBDIR}"
+    TARGET_PATH="${TARGET_BASE%/}/${SUBDIR}"
+else
+    SOURCE_PATH="$SOURCE_BASE"
+    TARGET_PATH="$TARGET_BASE"
+fi
 
 # Check if target directory exists, create if it doesn't
 if [ ! -d "$TARGET_PATH" ]; then
@@ -81,6 +118,19 @@ if [ ! -d "$TARGET_PATH" ]; then
         echo "Error: Failed to create target directory: $TARGET_PATH"
         exit 1
     fi
+fi
+
+# Display mount information
+if [ -n "$VERBOSE" ]; then
+    echo "NAS Server: $NAS_IP"
+    echo "Source Base: $SOURCE_BASE"
+    echo "Target Base: $TARGET_BASE"
+    if [ -n "$SUBDIR" ]; then
+        echo "Subdirectory: $SUBDIR"
+    fi
+    echo "Full Source Path: $SOURCE_PATH"
+    echo "Full Target Path: $TARGET_PATH"
+    echo ""
 fi
 
 # Check if already mounted
