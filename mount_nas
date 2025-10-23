@@ -1,0 +1,145 @@
+#!/bin/bash
+
+#display and exit-on-error for all commands
+set -e
+set +v
+
+echo "Mounting NFS4 directory from NAS server"
+
+# Default values
+NAS_IP="192.168.2.119"
+SOURCE_PATH="/mnt/ssd_data"
+TARGET_PATH="$HOME/nas_mounts"
+FORCE=""
+VERBOSE=""
+
+usage()
+{
+cat << eof
+usage: mount_nas <options>
+    -s, --server       NAS server IP address (default: 192.168.2.119)
+    --source           Source path on NAS server (default: /mnt/ssd_data)
+    -t, --target       Target mount directory (default: ~/nas_mounts)
+    -f, --force        Force remount if already mounted
+    -v, --verbose      Verbose output
+    -h, --help         Get usage info
+
+Examples:
+    mount_nas                                    # Mount with defaults
+    mount_nas --server=192.168.1.100            # Use different NAS IP
+    mount_nas --source=/data --target=/mnt/data # Custom paths
+    mount_nas --force --verbose                 # Force remount with verbose output
+eof
+}
+
+while [ "$1" != "" ]; do
+    PARAM=`echo $1 | awk -F= '{print $1}'`
+    VALUE=`echo $1 | awk -F= '{print $2}'`
+    case $PARAM in
+        -s | --server )
+            NAS_IP=$(echo $VALUE | tr -d '"')
+        ;;
+        --source )
+            SOURCE_PATH=$(echo $VALUE | tr -d '"')
+        ;;
+        -t | --target )
+            TARGET_PATH=$(echo $VALUE | tr -d '"')
+        ;;
+        -f | --force )
+            FORCE="Y"
+        ;;
+        -v | --verbose )
+            VERBOSE="Y"
+        ;;
+        -h | --help )
+            usage
+            exit 0
+        ;;
+        *)
+            echo "Unknown option $1"
+            echo "Use -h or --help for usage information"
+            exit 1
+        ;;
+    esac
+    shift
+done
+
+# Validate NAS IP format
+if ! [[ $NAS_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    echo "Error: Invalid IP address format: $NAS_IP"
+    exit 1
+fi
+
+# Expand ~ in target path
+TARGET_PATH="${TARGET_PATH/#\~/$HOME}"
+
+# Check if target directory exists, create if it doesn't
+if [ ! -d "$TARGET_PATH" ]; then
+    echo "Creating target directory: $TARGET_PATH"
+    mkdir -p "$TARGET_PATH"
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to create target directory: $TARGET_PATH"
+        exit 1
+    fi
+fi
+
+# Check if already mounted
+if mountpoint -q "$TARGET_PATH" 2>/dev/null; then
+    if [ -n "$FORCE" ]; then
+        echo "Target already mounted, forcing remount..."
+        sudo umount "$TARGET_PATH" || {
+            echo "Error: Failed to unmount existing mount at $TARGET_PATH"
+            exit 1
+        }
+    else
+        echo "Target $TARGET_PATH is already mounted"
+        echo "Use --force to remount"
+        exit 0
+    fi
+fi
+
+# Check if NFS client is installed
+if ! command -v mount.nfs4 &> /dev/null; then
+    echo "Error: NFS client not installed"
+    echo "Install with: sudo apt-get install nfs-common (Ubuntu/Debian)"
+    echo "Or: sudo yum install nfs-utils (CentOS/RHEL)"
+    exit 1
+fi
+
+# Test connectivity to NAS server
+if [ -n "$VERBOSE" ]; then
+    echo "Testing connectivity to NAS server at $NAS_IP..."
+fi
+if ! ping -c 1 -W 5 "$NAS_IP" &> /dev/null; then
+    echo "Error: Cannot reach NAS server at $NAS_IP"
+    echo "Please check network connectivity and server status"
+    exit 1
+fi
+
+# Construct the full NFS mount path
+NFS_PATH="${NAS_IP}:${SOURCE_PATH}"
+
+# Perform the mount
+echo "Mounting NFS4 share: $NFS_PATH -> $TARGET_PATH"
+
+if [ -n "$VERBOSE" ]; then
+    echo "Mount command: sudo mount -t nfs4 -o rw,hard,intr,noatime $NFS_PATH $TARGET_PATH"
+fi
+
+sudo mount -t nfs4 -o rw,hard,intr,noatime "$NFS_PATH" "$TARGET_PATH"
+
+if [ $? -eq 0 ]; then
+    echo "Successfully mounted NFS4 share"
+    if [ -n "$VERBOSE" ]; then
+        echo "Mount details:"
+        df -h "$TARGET_PATH"
+        echo ""
+        echo "Mount point contents:"
+        ls -la "$TARGET_PATH"
+    fi
+else
+    echo "Error: Failed to mount NFS4 share"
+    exit 1
+fi
+
+echo "NFS4 mount completed successfully"
