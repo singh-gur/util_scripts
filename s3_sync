@@ -1,0 +1,508 @@
+#!/bin/bash
+
+set -e
+set -u
+set -o pipefail
+
+# S3 Sync Utility
+# Syncs data between local filesystem and S3 with incremental updates
+# Supports profile-based authentication and efficient change detection
+
+VERSION="1.0.0"
+SCRIPT_NAME=$(basename "$0")
+
+# Default configuration
+SOURCE=""
+DESTINATION=""
+PROFILE="default"
+REGION="us-east-1"
+DRY_RUN=false
+VERBOSE=false
+DELETE=false
+INCLUDE=""
+EXCLUDE=""
+THREADS=5
+CHECKSUM_ALGORITHM="md5"
+
+# Temporary files
+TEMP_DIR="/tmp/s3_sync_$$"
+mkdir -p "$TEMP_DIR"
+CLEANUP_FILES=()
+
+cleanup() {
+    local exit_code=$?
+    echo "Cleaning up temporary files..."
+    for file in "${CLEANUP_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            rm -f "$file"
+            echo "Removed: $file"
+        fi
+    done
+    rmdir "$TEMP_DIR" 2>/dev/null || true
+    exit $exit_code
+}
+
+trap cleanup EXIT
+
+# Logging functions
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_error() {
+    echo "[ERROR] $1" >&2
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "[VERBOSE] $1"
+    fi
+}
+
+# Help function
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [options] <source> <destination>
+
+Sync data between local filesystem and S3 with incremental updates.
+
+Arguments:
+  source        Source path (local directory or s3://bucket/path)
+  destination   Destination path (local directory or s3://bucket/path)
+
+Options:
+  -p, --profile PROFILE    AWS profile to use (default: default)
+  -r, --region REGION     AWS region (default: us-east-1)
+  --dry-run              Show what would be done without making changes
+  -v, --verbose          Enable verbose output
+  --delete               Delete files in destination that don't exist in source
+  --include PATTERN      Include only files matching pattern (glob)
+  --exclude PATTERN      Exclude files matching pattern (glob)
+  --threads N            Number of parallel threads (default: 5)
+  --checksum ALGORITHM   Checksum algorithm (md5, sha1, sha256) (default: md5)
+  -h, --help             Show this help message
+
+Examples:
+  $SCRIPT_NAME ./local_dir s3://my-bucket/remote_dir
+  $SCRIPT_NAME s3://my-bucket/remote_dir ./local_dir --profile production --region us-west-2
+  $SCRIPT_NAME ./src s3://backup-bucket/src --delete --verbose
+  $SCRIPT_NAME s3://bucket/data ./local --include "*.txt" --exclude "temp/*"
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--profile)
+                PROFILE="$2"
+                shift 2
+                ;;
+            -r|--region)
+                REGION="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --delete)
+                DELETE=true
+                shift
+                ;;
+            --include)
+                INCLUDE="$2"
+                shift 2
+                ;;
+            --exclude)
+                EXCLUDE="$2"
+                shift 2
+                ;;
+            --threads)
+                THREADS="$2"
+                shift 2
+                ;;
+            --checksum)
+                CHECKSUM_ALGORITHM="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [[ -z "$SOURCE" ]]; then
+                    SOURCE="$1"
+                elif [[ -z "$DESTINATION" ]]; then
+                    DESTINATION="$1"
+                else
+                    log_error "Too many arguments"
+                    usage
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate required arguments
+    if [[ -z "$SOURCE" || -z "$DESTINATION" ]]; then
+        log_error "Source and destination are required"
+        usage
+        exit 1
+    fi
+
+    # Validate checksum algorithm
+    case "$CHECKSUM_ALGORITHM" in
+        md5|sha1|sha256)
+            ;;
+        *)
+            log_error "Invalid checksum algorithm: $CHECKSUM_ALGORITHM"
+            log_error "Supported algorithms: md5, sha1, sha256"
+            exit 1
+            ;;
+    esac
+}
+
+# Validate AWS dependencies
+validate_dependencies() {
+    local missing_deps=()
+    
+    if ! command -v aws &> /dev/null; then
+        missing_deps+=("awscli")
+    fi
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing_deps[*]}"
+        log_error "Please install the missing packages and try again."
+        exit 1
+    fi
+}
+
+# Check if path is S3
+is_s3_path() {
+    local path="$1"
+    [[ "$path" == s3://* ]]
+}
+
+# Debug function to check path types
+debug_path_types() {
+    local source_type="local"
+    local dest_type="local"
+    
+    if is_s3_path "$SOURCE"; then
+        source_type="S3"
+    fi
+    
+    if is_s3_path "$DESTINATION"; then
+        dest_type="S3"
+    fi
+    
+    log_verbose "Source path: $SOURCE (type: $source_type)"
+    log_verbose "Destination path: $DESTINATION (type: $dest_type)"
+}
+
+# Extract bucket and key from S3 path
+parse_s3_path() {
+    local s3_path="$1"
+    local bucket="${s3_path#s3://}"
+    local key=""
+    
+    if [[ "$bucket" == */* ]]; then
+        key="${bucket#*/}"
+        bucket="${bucket%%/*}"
+    fi
+    
+    echo "$bucket" "$key"
+}
+
+# Generate checksum for a file
+generate_checksum() {
+    local file="$1"
+    case "$CHECKSUM_ALGORITHM" in
+        md5)
+            md5sum "$file" | awk '{print $1}'
+            ;;
+        sha1)
+            sha1sum "$file" | awk '{print $1}'
+            ;;
+        sha256)
+            sha256sum "$file" | awk '{print $1}'
+            ;;
+    esac
+}
+
+# Get file metadata from S3
+get_s3_metadata() {
+    local bucket="$1"
+    local key="$2"
+    local temp_file="$TEMP_DIR/s3_metadata_$$.json"
+    
+    aws s3api head-object --bucket "$bucket" --key "$key" --profile "$PROFILE" --region "$REGION" > "$temp_file" 2>/dev/null || return 1
+    
+    local etag=$(jq -r '.ETag' "$temp_file" | tr -d '"')
+    local size=$(jq -r '.ContentLength' "$temp_file")
+    local last_modified=$(jq -r '.LastModified' "$temp_file")
+    
+    echo "$etag|$size|$last_modified"
+    CLEANUP_FILES+=("$temp_file")
+}
+
+# Check if file exists in S3 and get its metadata
+check_s3_file() {
+    local bucket="$1"
+    local key="$2"
+    local metadata
+    
+    metadata=$(get_s3_metadata "$bucket" "$key") || return 1
+    
+    echo "$metadata"
+}
+
+# Check if local file matches S3 file (by checksum and size)
+files_match() {
+    local local_file="$1"
+    local s3_metadata="$2"
+    
+    local local_size=$(stat -c %s "$local_file" 2>/dev/null || stat -f %z "$local_file")
+    local local_checksum=$(generate_checksum "$local_file")
+    
+    local s3_size=$(echo "$s3_metadata" | cut -d'|' -f2)
+    local s3_checksum=$(echo "$s3_metadata" | cut -d'|' -f1)
+    
+    [[ "$local_size" -eq "$s3_size" && "$local_checksum" == "$s3_checksum" ]]
+}
+
+# Sync a single file
+sync_file() {
+    local source="$1"
+    local dest="$2"
+    local source_is_s3="$3"
+    local dest_is_s3="$4"
+    
+    local source_bucket=""
+    local source_key=""
+    local dest_bucket=""
+    local dest_key=""
+    
+    if [[ "$source_is_s3" == true ]]; then
+        read -r source_bucket source_key <<< "$(parse_s3_path "$source")"
+    fi
+    
+    if [[ "$dest_is_s3" == true ]]; then
+        read -r dest_bucket dest_key <<< "$(parse_s3_path "$dest")"
+    fi
+    
+    local temp_file="$TEMP_DIR/sync_$$.tmp"
+    CLEANUP_FILES+=("$temp_file")
+    
+    if [[ "$source_is_s3" == true && "$dest_is_s3" == false ]]; then
+        # S3 to local
+        log_verbose "Downloading $source to $dest"
+        if [[ "$DRY_RUN" == false ]]; then
+            aws s3 cp "s3://$source_bucket/$source_key" "$dest" --profile "$PROFILE" --region "$REGION"
+        fi
+    elif [[ "$source_is_s3" == false && "$dest_is_s3" == true ]]; then
+        # Local to S3
+        log_verbose "Uploading $source to $dest"
+        if [[ "$DRY_RUN" == false ]]; then
+            aws s3 cp "$source" "s3://$dest_bucket/$dest_key" --profile "$PROFILE" --region "$REGION"
+        fi
+    else
+        log_error "Invalid sync direction"
+        return 1
+    fi
+    
+    log_info "Synced: $source -> $dest"
+}
+
+# Sync directory recursively
+sync_directory() {
+    local source="$1"
+    local dest="$2"
+    local source_is_s3="$3"
+    local dest_is_s3="$4"
+    
+    local source_bucket=""
+    local source_key=""
+    local dest_bucket=""
+    local dest_key=""
+    
+    if [[ "$source_is_s3" == true ]]; then
+        read -r source_bucket source_key <<< "$(parse_s3_path "$source")"
+    fi
+    
+    if [[ "$dest_is_s3" == true ]]; then
+        read -r dest_bucket dest_key <<< "$(parse_s3_path "$dest")"
+    fi
+    
+    # Create destination directory if local
+    if [[ "$dest_is_s3" == false && ! -d "$dest" ]]; then
+        if [[ "$DRY_RUN" == false ]]; then
+            mkdir -p "$dest"
+        fi
+        log_verbose "Created directory: $dest"
+    fi
+    
+    # List source files
+    local source_files=()
+    if [[ "$source_is_s3" == true ]]; then
+        # Get files from S3
+        local temp_list="$TEMP_DIR/s3_list_$$.txt"
+        CLEANUP_FILES+=("$temp_list")
+        
+        aws s3 ls "s3://$source_bucket/$source_key" --profile "$PROFILE" --region "$REGION" --recursive > "$temp_list"
+        
+        while IFS= read -r line; do
+            local file=$(echo "$line" | awk '{print $4}')
+            source_files+=("$file")
+        done < "$temp_list"
+    else
+        # Get files from local directory
+        if [[ -n "$INCLUDE" ]]; then
+            source_files=($(find "$source" -type f -name "$INCLUDE" 2>/dev/null))
+        elif [[ -n "$EXCLUDE" ]]; then
+            source_files=($(find "$source" -type f ! -name "$EXCLUDE" 2>/dev/null))
+        else
+            source_files=($(find "$source" -type f 2>/dev/null))
+        fi
+    fi
+    
+    # Process each file
+    for file in "${source_files[@]}"; do
+        local relative_path="${file#$source_key}"
+        local dest_file="$dest$relative_path"
+        
+        if [[ "$source_is_s3" == true ]]; then
+            local source_file="s3://$source_bucket/$file"
+            local dest_file_local="$dest$relative_path"
+            
+            # Check if destination file exists and is up-to-date
+            if [[ -f "$dest_file_local" ]]; then
+                local s3_metadata
+                s3_metadata=$(check_s3_file "$source_bucket" "$file") || continue
+                
+                if files_match "$dest_file_local" "$s3_metadata"; then
+                    log_verbose "Skipping unchanged: $dest_file_local"
+                    continue
+                fi
+            fi
+            
+            sync_file "$source_file" "$dest_file_local" true false
+        else
+            local source_file_local="$source/$file"
+            local dest_file_s3="s3://$dest_bucket/$dest_key$relative_path"
+            
+            # Check if destination file exists and is up-to-date
+            if is_s3_path "$dest_file_s3"; then
+                local s3_metadata
+                s3_metadata=$(check_s3_file "$dest_bucket" "$dest_key$relative_path") || continue
+                
+                if files_match "$source_file_local" "$s3_metadata"; then
+                    log_verbose "Skipping unchanged: $dest_file_s3"
+                    continue
+                fi
+            fi
+            
+            sync_file "$source_file_local" "$dest_file_s3" false true
+        fi
+    done
+    
+    # Handle deletion if requested
+    if [[ "$DELETE" == true && "$dest_is_s3" == false ]]; then
+        # Delete files in destination that don't exist in source
+        log_verbose "Checking for files to delete in $dest"
+        
+        local dest_files=()
+        if [[ -n "$INCLUDE" ]]; then
+            dest_files=($(find "$dest" -type f -name "$INCLUDE" 2>/dev/null))
+        elif [[ -n "$EXCLUDE" ]]; then
+            dest_files=($(find "$dest" -type f ! -name "$EXCLUDE" 2>/dev/null))
+        else
+            dest_files=($(find "$dest" -type f 2>/dev/null))
+        fi
+        
+        for file in "${dest_files[@]}"; do
+            local relative_path="${file#$dest}"
+            local source_file="$source$relative_path"
+            
+            if [[ ! -f "$source_file" ]]; then
+                log_verbose "Deleting: $file"
+                if [[ "$DRY_RUN" == false ]]; then
+                    rm -f "$file"
+                fi
+            fi
+        done
+    elif [[ "$DELETE" == true && "$source_is_s3" == false ]]; then
+        log_error "Delete option only supported for local destination"
+        return 1
+    fi
+}
+
+# Main sync function
+perform_sync() {
+    local source_is_s3=false
+    local dest_is_s3=false
+    
+    # Determine source type
+    if is_s3_path "$SOURCE"; then
+        source_is_s3=true
+    fi
+    
+    # Determine destination type  
+    if is_s3_path "$DESTINATION"; then
+        dest_is_s3=true
+    fi
+    
+    # Validate sync direction
+    if [[ "$source_is_s3" == "$dest_is_s3" ]]; then
+        log_error "Both source and destination cannot be the same type (both S3 or both local)"
+        exit 1
+    fi
+    
+    # Perform sync
+    if [[ -d "$SOURCE" || "$source_is_s3" == true ]]; then
+        sync_directory "$SOURCE" "$DESTINATION" "$source_is_s3" "$dest_is_s3"
+    else
+        log_error "Source must be a directory"
+        exit 1
+    fi
+}
+
+# Main function
+main() {
+    parse_args "$@"
+    validate_dependencies
+    
+    log_info "Starting S3 Sync Utility v$VERSION"
+    log_info "Source: $SOURCE"
+    log_info "Destination: $DESTINATION"
+    log_info "Profile: $PROFILE"
+    log_info "Region: $REGION"
+    log_info "Dry run: $DRY_RUN"
+    log_info "Verbose: $VERBOSE"
+    log_info "Delete: $DELETE"
+    log_info "Checksum: $CHECKSUM_ALGORITHM"
+    
+    # Debug path types
+    debug_path_types
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "Dry run mode - no changes will be made"
+    fi
+    
+    perform_sync
+    log_info "Sync completed successfully"
+}
+
+main "$@"
