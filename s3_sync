@@ -8,7 +8,7 @@ set -o pipefail
 # Syncs data between local filesystem and S3 using AWS CLI sync command
 # Leverages AWS's built-in incremental sync capabilities
 
-VERSION="1.0.0"
+VERSION="1.2.0"
 SCRIPT_NAME=$(basename "$0")
 
 # Default configuration
@@ -23,6 +23,11 @@ INCLUDE=""
 EXCLUDE=""
 SIZE_ONLY=false
 EXACT_TIMESTAMPS=false
+BACKGROUND=false
+
+# Argument tracking
+ORIGINAL_ARGS=()
+CHILD_ARGS=()
 
 # Temporary files
 TEMP_DIR="/tmp/s3_sync_$$"
@@ -80,6 +85,7 @@ Options:
   --exclude PATTERN      Exclude files matching pattern (glob)
   --size-only            Compare files by size only (faster)
   --exact-timestamps     Compare files by exact timestamps (more accurate)
+  --background           Run sync in a detached tmux session
   -h, --help             Show this help message
 
 Examples:
@@ -89,6 +95,7 @@ Examples:
   $SCRIPT_NAME s3://bucket/data ./local --include "*.txt" --exclude "temp/*"
   $SCRIPT_NAME ./data s3://bucket/data --size-only  # Faster sync
   $SCRIPT_NAME ./data s3://bucket/data --exact-timestamps  # More accurate sync
+  $SCRIPT_NAME ./data s3://bucket/data --background  # Run in detached tmux session
 
 EOF
 }
@@ -131,6 +138,10 @@ parse_args() {
                 ;;
             --exact-timestamps)
                 EXACT_TIMESTAMPS=true
+                shift
+                ;;
+            --background)
+                BACKGROUND=true
                 shift
                 ;;
             -h|--help)
@@ -184,6 +195,60 @@ validate_dependencies() {
 is_s3_path() {
     local path="$1"
     [[ "$path" == s3://* ]]
+}
+
+build_child_args() {
+    CHILD_ARGS=()
+    for arg in "${ORIGINAL_ARGS[@]}"; do
+        if [[ "$arg" == "--background" ]]; then
+            continue
+        fi
+        CHILD_ARGS+=("$arg")
+    done
+}
+
+launch_in_background() {
+    build_child_args
+
+    if [[ ${#CHILD_ARGS[@]} -eq 0 ]]; then
+        log_error "No arguments supplied for background execution"
+        exit 1
+    fi
+
+    if ! command -v tmux >/dev/null 2>&1; then
+        log_error "--background requires tmux to be installed"
+        exit 1
+    fi
+
+    local timestamp session_name base_session command_string=""
+    timestamp=$(date +%s)
+    base_session="s3_sync_${timestamp}"
+    session_name="$base_session"
+
+    local counter=1
+    while tmux has-session -t "$session_name" 2>/dev/null; do
+        session_name="${base_session}_$counter"
+        ((counter++))
+    done
+
+    local cmd=("$0" "${CHILD_ARGS[@]}")
+    local part=""
+    for arg in "${cmd[@]}"; do
+        printf -v part '%q' "$arg"
+        command_string+=" $part"
+    done
+
+    command_string=${command_string# }
+
+    log_info "Launching sync in background via tmux session: $session_name"
+
+    if ! tmux new-session -d -s "$session_name" "$command_string"; then
+        log_error "Failed to create tmux session"
+        exit 1
+    fi
+
+    log_info "Attach with: tmux attach -t $session_name"
+    log_info "Detach with: Ctrl-b then d"
 }
 
 # Main sync function
@@ -269,7 +334,14 @@ perform_sync() {
 
 # Main function
 main() {
+    ORIGINAL_ARGS=("$@")
     parse_args "$@"
+
+    if [[ "$BACKGROUND" == true ]]; then
+        launch_in_background
+        exit 0
+    fi
+
     validate_dependencies
     
     log_info "Starting S3 Sync Utility v$VERSION"
