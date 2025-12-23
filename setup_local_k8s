@@ -1,0 +1,296 @@
+#!/bin/bash
+
+# Exit on error
+set -e
+
+echo "Setting up Minikube with ArgoCD"
+
+# Default values
+NODES=1
+DRIVER="virtualbox"
+REPO_URL="git@github.com:singh-gur/helm_charts.git"
+SSH_KEY=""
+APP_PATH="charts/root-app"
+VALUES_FILE="values_local.yaml"
+FORCE=""
+
+usage()
+{
+cat << EOF
+Usage: setup_local_k8s [options]
+
+Options:
+    -n, --nodes         Number of nodes for minikube cluster (default: 1)
+    -d, --driver        Minikube driver to use (default: virtualbox)
+                        Options: docker, kvm2, virtualbox, podman, etc.
+    -r, --repo          Git repository URL for ArgoCD (default: git@github.com:singh-gur/helm_charts.git)
+    -k, --ssh-key       Path to SSH private key file for git authentication (required for SSH repos)
+    -p, --app-path      Path to root app in repository (default: charts/root-app)
+    -v, --values        Values file to use (default: values_local.yaml)
+    -f, --force         Force delete existing minikube cluster and recreate
+    -h, --help          Show this help message
+
+Description:
+    This script automates the setup of a local Minikube cluster with ArgoCD configured
+    for GitOps deployments. It performs the following steps:
+
+    1. Creates/starts a Minikube cluster with specified nodes and driver
+    2. Enables required addons (ingress, metrics-server)
+    3. Installs ArgoCD in the default namespace
+    4. Configures ArgoCD with the specified Git repository using SSH authentication
+    5. Creates a root application from the repository
+
+Prerequisites:
+    - minikube must be installed
+    - kubectl must be installed
+    - SSH key must be available if using SSH git URLs
+
+Examples:
+    # Basic setup with defaults
+    ./setup_local_k8s --ssh-key=~/.ssh/id_rsa
+
+    # Multi-node cluster with custom driver
+    ./setup_local_k8s --nodes=3 --driver=kvm2 --ssh-key=~/.ssh/id_rsa
+
+    # Custom repository and app path
+    ./setup_local_k8s --repo=git@github.com:myorg/myrepo.git \\
+        --app-path=apps/dev --values=values_dev.yaml --ssh-key=~/.ssh/deploy_key
+
+    # Force recreate cluster
+    ./setup_local_k8s --force --ssh-key=~/.ssh/id_rsa
+
+EOF
+}
+
+while [ "$1" != "" ]; do
+    PARAM=$(echo $1 | awk -F= '{print $1}')
+    VALUE=$(echo $1 | awk -F= '{print $2}')
+    case $PARAM in
+        -n | --nodes )
+            NODES=$(echo $VALUE | tr -d '"')
+        ;;
+        -d | --driver )
+            DRIVER=$(echo $VALUE | tr -d '"')
+        ;;
+        -r | --repo )
+            REPO_URL=$(echo $VALUE | tr -d '"')
+        ;;
+        -k | --ssh-key )
+            SSH_KEY=$(echo $VALUE | tr -d '"')
+        ;;
+        -p | --app-path )
+            APP_PATH=$(echo $VALUE | tr -d '"')
+        ;;
+        -v | --values )
+            VALUES_FILE=$(echo $VALUE | tr -d '"')
+        ;;
+        -f | --force )
+            FORCE="Y"
+        ;;
+        -h | --help )
+            usage
+            exit 0
+        ;;
+        * )
+            echo "Unknown option: $PARAM"
+            echo "Use -h or --help for usage information"
+            exit 1
+        ;;
+    esac
+    shift
+done
+
+# Prerequisite checks
+echo "Checking prerequisites..."
+
+if ! command -v minikube &> /dev/null; then
+    echo "Error: minikube is not installed"
+    echo "Please install it from: https://minikube.sigs.k8s.io/docs/start/"
+    exit 1
+fi
+
+if ! command -v kubectl &> /dev/null; then
+    echo "Error: kubectl is not installed"
+    echo "Please install it from: https://kubernetes.io/docs/tasks/tools/"
+    exit 1
+fi
+
+# Validate SSH key if using SSH repo
+if [[ "$REPO_URL" == git@* ]] || [[ "$REPO_URL" == ssh://* ]]; then
+    if [[ -z "$SSH_KEY" ]]; then
+        echo "Error: SSH key is required for SSH repository URLs"
+        echo "Please provide --ssh-key parameter"
+        exit 1
+    fi
+
+    # Expand tilde in SSH_KEY path
+    SSH_KEY="${SSH_KEY/#\~/$HOME}"
+
+    if [[ ! -f "$SSH_KEY" ]]; then
+        echo "Error: SSH key file not found: $SSH_KEY"
+        exit 1
+    fi
+fi
+
+echo "Configuration:"
+echo "  Nodes: $NODES"
+echo "  Driver: $DRIVER"
+echo "  Repository: $REPO_URL"
+echo "  SSH Key: ${SSH_KEY:-"Not provided"}"
+echo "  App Path: $APP_PATH"
+echo "  Values File: $VALUES_FILE"
+echo ""
+
+# Check if minikube is already running
+if minikube status &> /dev/null; then
+    if [[ -n "$FORCE" ]]; then
+        echo "Force flag set. Deleting existing minikube cluster..."
+        minikube delete
+    else
+        echo "Minikube cluster already exists. Use --force to recreate."
+        echo "Continuing with existing cluster..."
+    fi
+fi
+
+# Start minikube cluster
+if ! minikube status &> /dev/null; then
+    echo "Starting minikube cluster with $NODES node(s) using $DRIVER driver..."
+    if [[ "$NODES" -gt 1 ]]; then
+        minikube start --nodes="$NODES" --driver="$DRIVER"
+    else
+        minikube start --driver="$DRIVER"
+    fi
+    echo "Minikube cluster started successfully"
+else
+    echo "Using existing minikube cluster"
+fi
+
+# Enable required addons
+echo "Enabling minikube addons..."
+minikube addons enable ingress
+minikube addons enable metrics-server
+echo "Addons enabled successfully"
+
+# Wait for cluster to be ready
+echo "Waiting for cluster to be ready..."
+kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+# Install ArgoCD
+echo "Installing ArgoCD in default namespace..."
+
+# Check if ArgoCD is already installed
+if kubectl get deployment argocd-server -n default &> /dev/null; then
+    echo "ArgoCD is already installed in default namespace"
+else
+    # Download and apply ArgoCD manifests
+    kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+    # Wait for ArgoCD to be ready
+    echo "Waiting for ArgoCD to be ready..."
+    kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+    # Move ArgoCD to default namespace
+    echo "Moving ArgoCD resources to default namespace..."
+    kubectl get all -n argocd -o yaml | sed 's/namespace: argocd/namespace: default/g' | kubectl apply -f -
+    kubectl delete namespace argocd
+fi
+
+# Wait for ArgoCD server to be ready in default namespace
+echo "Waiting for ArgoCD server to be ready in default namespace..."
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n default
+
+# Configure Git repository with SSH authentication
+if [[ -n "$SSH_KEY" ]]; then
+    echo "Configuring ArgoCD with Git repository using SSH authentication..."
+
+    # Create secret with SSH private key
+    kubectl create secret generic argocd-repo-creds \
+        --from-file=sshPrivateKey="$SSH_KEY" \
+        --dry-run=client -o yaml | kubectl apply -n default -f -
+
+    # Label the secret for ArgoCD
+    kubectl label secret argocd-repo-creds \
+        argocd.argoproj.io/secret-type=repo-creds \
+        -n default --overwrite
+
+    # Add repository to ArgoCD
+    REPO_NAME=$(echo "$REPO_URL" | sed 's/.*[:/]\([^/]*\)\.git/\1/')
+
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${REPO_NAME}-repo
+  namespace: default
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: git
+  url: ${REPO_URL}
+  sshPrivateKey: |
+$(cat "$SSH_KEY" | sed 's/^/    /')
+EOF
+
+    echo "Git repository configured successfully"
+fi
+
+# Create root application
+echo "Creating root application..."
+
+APP_NAME=$(basename "$APP_PATH")
+
+cat <<EOF | kubectl apply -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP_NAME}
+  namespace: default
+spec:
+  project: default
+  source:
+    repoURL: ${REPO_URL}
+    targetRevision: HEAD
+    path: ${APP_PATH}
+    helm:
+      valueFiles:
+        - ${VALUES_FILE}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+EOF
+
+echo "Root application created successfully"
+
+# Get ArgoCD admin password
+echo ""
+echo "=========================================="
+echo "Setup completed successfully!"
+echo "=========================================="
+echo ""
+echo "Minikube cluster information:"
+kubectl cluster-info
+echo ""
+echo "ArgoCD admin password:"
+kubectl -n default get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+echo ""
+echo ""
+echo "To access ArgoCD UI, run:"
+echo "  kubectl port-forward svc/argocd-server -n default 8081:443"
+echo "Then visit: https://localhost:8081"
+echo "Username: admin"
+echo ""
+echo "To access ArgoCD CLI:"
+echo "  argocd login localhost:8081"
+echo ""
+echo "Root application '${APP_NAME}' has been created from:"
+echo "  Repository: ${REPO_URL}"
+echo "  Path: ${APP_PATH}"
+echo "  Values: ${VALUES_FILE}"
+echo ""
