@@ -165,6 +165,19 @@ else
     echo "Using existing minikube cluster"
 fi
 
+# Switch to minikube context to ensure we don't interfere with other clusters
+echo "Switching to minikube context..."
+kubectl config use-context minikube
+
+# Verify we're using the correct context
+CURRENT_CONTEXT=$(kubectl config current-context)
+if [[ "$CURRENT_CONTEXT" != "minikube" ]]; then
+    echo "Error: Failed to switch to minikube context. Current context: $CURRENT_CONTEXT"
+    echo "This is a safety check to prevent interfering with other clusters."
+    exit 1
+fi
+echo "Confirmed using minikube context"
+
 # Enable required addons
 echo "Enabling minikube addons..."
 minikube addons enable ingress
@@ -293,4 +306,9 @@ echo "Root application '${APP_NAME}' has been created from:"
 echo "  Repository: ${REPO_URL}"
 echo "  Path: ${APP_PATH}"
 echo "  Values: ${VALUES_FILE}"
+echo ""
+echo "IMPORTANT: Your kubectl context is now set to 'minikube'"
+echo "To switch back to another context, run:"
+echo "  kubectl config get-contexts  # List all contexts"
+echo "  kubectl config use-context <context-name>"
 echo ""
