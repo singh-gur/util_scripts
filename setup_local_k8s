@@ -241,6 +241,7 @@ if [[ -n "$SSH_KEY" ]]; then
 
     # Add repository to ArgoCD
     REPO_NAME=$(echo "$REPO_URL" | sed 's/.*[:/]\([^/]*\)\.git/\1/')
+    REPO_NAME=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 
     cat <<EOF | kubectl apply -f -
 apiVersion: v1
