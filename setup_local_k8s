@@ -2,6 +2,7 @@
 
 # Exit on error
 set -e
+set -o pipefail
 
 echo "Setting up Minikube with ArgoCD"
 
@@ -12,6 +13,7 @@ REPO_URL="git@github.com:singh-gur/helm_charts.git"
 SSH_KEY=""
 APP_PATH="charts/root-app"
 VALUES_FILE="values_local.yaml"
+ARGOCD_NAMESPACE="default"
 FORCE=""
 
 usage()
@@ -27,6 +29,7 @@ Options:
     -k, --ssh-key       Path to SSH private key file for git authentication (required for SSH repos)
     -p, --app-path      Path to root app in repository (default: charts/root-app)
     -v, --values        Values file to use (default: values_local.yaml)
+    -a, --argocd-namespace Namespace to install ArgoCD into (default: default)
     -f, --force         Force delete existing minikube cluster and recreate
     -h, --help          Show this help message
 
@@ -84,6 +87,9 @@ while [ "$1" != "" ]; do
         -v | --values )
             VALUES_FILE=$(echo $VALUE | tr -d '"')
         ;;
+        -a | --argocd-namespace )
+            ARGOCD_NAMESPACE=$(echo $VALUE | tr -d '"')
+        ;;
         -f | --force )
             FORCE="Y"
         ;;
@@ -115,6 +121,12 @@ if ! command -v kubectl &> /dev/null; then
     exit 1
 fi
 
+if ! command -v curl &> /dev/null; then
+    echo "Error: curl is not installed"
+    echo "Please install curl to download ArgoCD manifests"
+    exit 1
+fi
+
 # Validate SSH key if using SSH repo
 if [[ "$REPO_URL" == git@* ]] || [[ "$REPO_URL" == ssh://* ]]; then
     if [[ -z "$SSH_KEY" ]]; then
@@ -139,6 +151,7 @@ echo "  Repository: $REPO_URL"
 echo "  SSH Key: ${SSH_KEY:-"Not provided"}"
 echo "  App Path: $APP_PATH"
 echo "  Values File: $VALUES_FILE"
+echo "  ArgoCD Namespace: $ARGOCD_NAMESPACE"
 echo ""
 
 # Check if minikube is already running
@@ -189,29 +202,28 @@ echo "Waiting for cluster to be ready..."
 kubectl wait --for=condition=Ready nodes --all --timeout=300s
 
 # Install ArgoCD
-echo "Installing ArgoCD in default namespace..."
+echo "Installing ArgoCD in namespace '${ARGOCD_NAMESPACE}'..."
 
 # Check if ArgoCD is already installed
-if kubectl get deployment argocd-server -n default &> /dev/null; then
-    echo "ArgoCD is already installed in default namespace"
+if kubectl get deployment argocd-server -n "${ARGOCD_NAMESPACE}" &> /dev/null; then
+    echo "ArgoCD is already installed in namespace '${ARGOCD_NAMESPACE}'"
 else
-    # Download and apply ArgoCD manifests
-    kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
-    kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+    # Ensure namespace exists (no-op for 'default')
+    kubectl create namespace "${ARGOCD_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+    # Download and apply ArgoCD manifests into the desired namespace
+    curl -fsSL https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml | \
+        sed "s/namespace: argocd/namespace: ${ARGOCD_NAMESPACE}/g" | \
+        kubectl apply -n "${ARGOCD_NAMESPACE}" -f -
 
     # Wait for ArgoCD to be ready
     echo "Waiting for ArgoCD to be ready..."
-    kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
-
-    # Move ArgoCD to default namespace
-    echo "Moving ArgoCD resources to default namespace..."
-    kubectl get all -n argocd -o yaml | sed 's/namespace: argocd/namespace: default/g' | kubectl apply -f -
-    kubectl delete namespace argocd
+    kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n "${ARGOCD_NAMESPACE}"
 fi
 
-# Wait for ArgoCD server to be ready in default namespace
-echo "Waiting for ArgoCD server to be ready in default namespace..."
-kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n default
+# Wait for ArgoCD server to be ready
+echo "Waiting for ArgoCD server to be ready in namespace '${ARGOCD_NAMESPACE}'..."
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n "${ARGOCD_NAMESPACE}"
 
 # Configure Git repository with SSH authentication
 if [[ -n "$SSH_KEY" ]]; then
@@ -220,12 +232,12 @@ if [[ -n "$SSH_KEY" ]]; then
     # Create secret with SSH private key
     kubectl create secret generic argocd-repo-creds \
         --from-file=sshPrivateKey="$SSH_KEY" \
-        --dry-run=client -o yaml | kubectl apply -n default -f -
+        --dry-run=client -o yaml | kubectl apply -n "${ARGOCD_NAMESPACE}" -f -
 
     # Label the secret for ArgoCD
     kubectl label secret argocd-repo-creds \
         argocd.argoproj.io/secret-type=repo-creds \
-        -n default --overwrite
+        -n "${ARGOCD_NAMESPACE}" --overwrite
 
     # Add repository to ArgoCD
     REPO_NAME=$(echo "$REPO_URL" | sed 's/.*[:/]\([^/]*\)\.git/\1/')
@@ -235,7 +247,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: ${REPO_NAME}-repo
-  namespace: default
+  namespace: ${ARGOCD_NAMESPACE}
   labels:
     argocd.argoproj.io/secret-type: repository
 stringData:
@@ -258,7 +270,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: ${APP_NAME}
-  namespace: default
+  namespace: ${ARGOCD_NAMESPACE}
 spec:
   project: default
   source:
@@ -291,11 +303,11 @@ echo "Minikube cluster information:"
 kubectl cluster-info
 echo ""
 echo "ArgoCD admin password:"
-kubectl -n default get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+kubectl -n "${ARGOCD_NAMESPACE}" get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
 echo ""
 echo ""
 echo "To access ArgoCD UI, run:"
-echo "  kubectl port-forward svc/argocd-server -n default 8081:443"
+echo "  kubectl port-forward svc/argocd-server -n ${ARGOCD_NAMESPACE} 8081:443"
 echo "Then visit: https://localhost:8081"
 echo "Username: admin"
 echo ""
