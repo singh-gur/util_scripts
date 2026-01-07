@@ -137,9 +137,9 @@ fi
 # Create GitHub repository
 echo "Creating GitHub repository..."
 if [ -n "$DESCRIPTION" ]; then
-    gh repo create "$REPO_NAME" $PRIVATE --description "$DESCRIPTION" --source . --remote "$REMOTE" --push --branch "$BRANCH"
+    gh repo create "$REPO_NAME" $PRIVATE --description "$DESCRIPTION" --source . --remote "$REMOTE" --push
 else
-    gh repo create "$REPO_NAME" $PRIVATE --source . --remote "$REMOTE" --push --branch "$BRANCH"
+    gh repo create "$REPO_NAME" $PRIVATE --source . --remote "$REMOTE" --push
 fi
 
 if [ $? -eq 0 ]; then
