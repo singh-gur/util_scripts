@@ -8,6 +8,7 @@ Usage: create_github_repo [options]
 Options:
     -n, --name          Repository name (default: current directory name)
     -d, --description   Repository description
+    -b, --branch        Initial branch name (default: main)
     -p, --private       Create private repository (default: public)
     -r, --remote        Remote name (default: origin)
     -h, --help          Show this help message
@@ -26,6 +27,7 @@ REPO_NAME=$(basename "$PWD")
 DESCRIPTION=""
 PRIVATE="--public"
 REMOTE="origin"
+BRANCH="main"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -45,6 +47,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     -r|--remote)
       REMOTE="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -b|--branch)
+      BRANCH="$2"
       shift # past argument
       shift # past value
       ;;
@@ -81,14 +88,15 @@ fi
 echo "Repository Name: ${REPO_NAME}"
 echo "Description: ${DESCRIPTION:-"No description provided"}"
 echo "Visibility: $([ -n "$PRIVATE" ] && echo "Private" || echo "Public")"
+echo "Branch: ${BRANCH}"
 echo "Remote Name: ${REMOTE}"
 echo "Current Directory: $PWD"
 
 # Initialize git repository if not already initialized
 if [ ! -d ".git" ]; then
-    echo "Initializing git repository..."
-    git init
-    echo "Git repository initialized"
+    echo "Initializing git repository with branch: $BRANCH..."
+    git init -b "$BRANCH"
+    echo "Git repository initialized on branch: $BRANCH"
 fi
 
 # Create .gitignore if it doesn't exist
@@ -129,9 +137,9 @@ fi
 # Create GitHub repository
 echo "Creating GitHub repository..."
 if [ -n "$DESCRIPTION" ]; then
-    gh repo create "$REPO_NAME" $PRIVATE --description "$DESCRIPTION" --source . --remote "$REMOTE" --push
+    gh repo create "$REPO_NAME" $PRIVATE --description "$DESCRIPTION" --source . --remote "$REMOTE" --push --branch "$BRANCH"
 else
-    gh repo create "$REPO_NAME" $PRIVATE --source . --remote "$REMOTE" --push
+    gh repo create "$REPO_NAME" $PRIVATE --source . --remote "$REMOTE" --push --branch "$BRANCH"
 fi
 
 if [ $? -eq 0 ]; then
