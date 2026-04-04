@@ -1,0 +1,538 @@
+#!/bin/bash
+
+set -e
+set -u
+set -o pipefail
+
+SCRIPT_NAME=$(basename "$0")
+
+SOURCE=""
+TARGET=""
+SOURCE_USER=""
+SOURCE_TOKEN=""
+TARGET_USER=""
+TARGET_TOKEN=""
+SSH_KEY=""
+BRANCHES=()
+TAGS=()
+TEMP_DIR="/tmp"
+KEEP_LOCAL="false"
+DRY_RUN="false"
+
+CLONE_DIR=""
+
+CLEANUP_DIRS=()
+
+cleanup() {
+    local exit_code=$?
+    if [[ "$KEEP_LOCAL" != "true" ]]; then
+        echo "Cleaning up temporary clone..."
+        for dir in "${CLEANUP_DIRS[@]}"; do
+            if [[ -d "$dir" ]]; then
+                rm -rf "$dir"
+                echo "Removed: $dir"
+            fi
+        done
+    else
+        echo "Keeping local clone at: $CLONE_DIR"
+    fi
+    exit $exit_code
+}
+
+trap cleanup EXIT
+
+validate_dependencies() {
+    local missing_deps=()
+
+    if ! command -v git >/dev/null 2>&1; then
+        missing_deps+=("git")
+    fi
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing_deps[*]}" >&2
+        echo "Please install the missing packages and try again." >&2
+        exit 1
+    fi
+}
+
+usage() {
+    cat << EOF
+usage: $SCRIPT_NAME [options]
+
+Mirror a git repository from one remote to another, including all branches,
+tags, and refs. Supports protocol mixing (e.g., SSH source -> HTTPS target).
+
+Required:
+  --source URL            Source remote URL (SSH or HTTPS)
+  --target URL            Target remote URL (SSH or HTTPS)
+
+HTTPS Authentication:
+  --source-user USER      Username for HTTPS source clone
+  --source-token TOKEN    Password/token for HTTPS source clone
+  --target-user USER      Username for HTTPS target push
+  --target-token TOKEN    Password/token for HTTPS target push
+
+SSH Authentication:
+  --ssh-key PATH          Custom SSH private key path
+
+Filtering:
+  --branches PATTERN      Push only branches matching pattern (repeatable)
+                          Supports glob patterns: main, feature/*, release-*
+  --tags PATTERN          Push only tags matching pattern (repeatable)
+                          Supports glob patterns: v*, *-rc
+
+Options:
+  --temp-dir DIR          Temporary directory for clone (default: $TEMP_DIR)
+  --keep-local            Keep cloned repository after push
+  --dry-run               Show what would be done without making changes
+  -h, --help              Show this help message
+
+Examples:
+  $SCRIPT_NAME --source git@github.com:user/repo.git --target https://gitlab.com/user/repo.git
+
+  $SCRIPT_NAME \\
+    --source https://github.com/user/repo.git \\
+    --source-user myuser --source-token ghp_xxxxx \\
+    --target https://gitlab.com/user/repo.git \\
+    --target-user myuser --target-token glpat-xxxxx
+
+  $SCRIPT_NAME \\
+    --source git@github.com:user/repo.git \\
+    --target git@gitlab.com:user/repo.git \\
+    --ssh-key ~/.ssh/id_ed25519
+
+  $SCRIPT_NAME \\
+    --source https://github.com/user/repo.git \\
+    --target https://gitlab.com/user/repo.git \\
+    --target-user myuser --target-token glpat-xxxxx \\
+    --branches "main" --branches "release/*"
+
+  $SCRIPT_NAME --source git@github.com:user/repo.git --target https://gitlab.com/user/repo.git --dry-run
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --source)
+            SOURCE="$2"
+            shift 2
+            ;;
+        --source=*)
+            SOURCE="${1#*=}"
+            shift
+            ;;
+        --target)
+            TARGET="$2"
+            shift 2
+            ;;
+        --target=*)
+            TARGET="${1#*=}"
+            shift
+            ;;
+        --source-user)
+            SOURCE_USER="$2"
+            shift 2
+            ;;
+        --source-user=*)
+            SOURCE_USER="${1#*=}"
+            shift
+            ;;
+        --source-token)
+            SOURCE_TOKEN="$2"
+            shift 2
+            ;;
+        --source-token=*)
+            SOURCE_TOKEN="${1#*=}"
+            shift
+            ;;
+        --target-user)
+            TARGET_USER="$2"
+            shift 2
+            ;;
+        --target-user=*)
+            TARGET_USER="${1#*=}"
+            shift
+            ;;
+        --target-token)
+            TARGET_TOKEN="$2"
+            shift 2
+            ;;
+        --target-token=*)
+            TARGET_TOKEN="${1#*=}"
+            shift
+            ;;
+        --ssh-key)
+            SSH_KEY="$2"
+            shift 2
+            ;;
+        --ssh-key=*)
+            SSH_KEY="${1#*=}"
+            shift
+            ;;
+        --branches)
+            BRANCHES+=("$2")
+            shift 2
+            ;;
+        --branches=*)
+            BRANCHES+=("${1#*=}")
+            shift
+            ;;
+        --tags)
+            TAGS+=("$2")
+            shift 2
+            ;;
+        --tags=*)
+            TAGS+=("${1#*=}")
+            shift
+            ;;
+        --temp-dir)
+            TEMP_DIR="$2"
+            shift 2
+            ;;
+        --temp-dir=*)
+            TEMP_DIR="${1#*=}"
+            shift
+            ;;
+        --keep-local)
+            KEEP_LOCAL="true"
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN="true"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+    esac
+done
+
+validate_parameters() {
+    if [[ -z "$SOURCE" ]]; then
+        echo "Error: Source URL is required. Use --source" >&2
+        exit 1
+    fi
+
+    if [[ -z "$TARGET" ]]; then
+        echo "Error: Target URL is required. Use --target" >&2
+        exit 1
+    fi
+
+    if [[ -n "$SOURCE_USER" && -z "$SOURCE_TOKEN" ]]; then
+        echo "Error: --source-token is required when --source-user is provided" >&2
+        exit 1
+    fi
+
+    if [[ -z "$SOURCE_USER" && -n "$SOURCE_TOKEN" ]]; then
+        echo "Error: --source-user is required when --source-token is provided" >&2
+        exit 1
+    fi
+
+    if [[ -n "$TARGET_USER" && -z "$TARGET_TOKEN" ]]; then
+        echo "Error: --target-token is required when --target-user is provided" >&2
+        exit 1
+    fi
+
+    if [[ -z "$TARGET_USER" && -n "$TARGET_TOKEN" ]]; then
+        echo "Error: --target-user is required when --target-token is provided" >&2
+        exit 1
+    fi
+
+    if [[ ! -d "$TEMP_DIR" ]]; then
+        echo "Creating temporary directory: $TEMP_DIR"
+        if ! mkdir -p "$TEMP_DIR"; then
+            echo "Error: Failed to create temporary directory '$TEMP_DIR'" >&2
+            exit 1
+        fi
+    fi
+
+    if [[ ! -w "$TEMP_DIR" ]]; then
+        echo "Error: Temporary directory '$TEMP_DIR' is not writable" >&2
+        exit 1
+    fi
+
+    if [[ -n "$SSH_KEY" ]]; then
+        SSH_KEY="${SSH_KEY/#\~/$HOME}"
+        if [[ ! -f "$SSH_KEY" ]]; then
+            echo "Error: SSH key not found: $SSH_KEY" >&2
+            exit 1
+        fi
+    fi
+}
+
+urlencode() {
+    local string="$1"
+    local strlen=${#string}
+    local encoded=""
+    local pos char code
+
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+        char="${string:$pos:1}"
+        case "$char" in
+            [-_.~a-zA-Z0-9]) encoded+="${char}" ;;
+            *)
+                printf -v code '%%%02X' "'$char"
+                encoded+="${code}"
+                ;;
+        esac
+    done
+    echo "$encoded"
+}
+
+inject_credentials() {
+    local url="$1"
+    local user="$2"
+    local token="$3"
+
+    if [[ -z "$user" || -z "$token" ]]; then
+        echo "$url"
+        return
+    fi
+
+    if [[ "$url" == https://* ]]; then
+        local encoded_user encoded_token
+        encoded_user=$(urlencode "$user")
+        encoded_token=$(urlencode "$token")
+        echo "${url/https:\/\//https:\/\/${encoded_user}:${encoded_token}@}"
+    else
+        echo "Error: Credentials can only be injected into HTTPS URLs" >&2
+        exit 1
+    fi
+}
+
+setup_ssh() {
+    if [[ -n "$SSH_KEY" ]]; then
+        export GIT_SSH_COMMAND="ssh -i \"$SSH_KEY\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+        echo "Using SSH key: $SSH_KEY"
+    fi
+}
+
+clone_source() {
+    local source_url="$SOURCE"
+    local use_filters="false"
+
+    if [[ ${#BRANCHES[@]} -gt 0 || ${#TAGS[@]} -gt 0 ]]; then
+        use_filters="true"
+    fi
+
+    if [[ -n "$SOURCE_USER" && -n "$SOURCE_TOKEN" ]]; then
+        source_url=$(inject_credentials "$SOURCE" "$SOURCE_USER" "$SOURCE_TOKEN")
+        echo "Using HTTPS credentials for source clone"
+    fi
+
+    local repo_name=$(basename "$SOURCE" .git)
+    CLONE_DIR="$TEMP_DIR/${repo_name}-mirror-$$"
+    CLEANUP_DIRS+=("$CLONE_DIR")
+
+    echo "Cloning source repository..."
+    echo "Source: $SOURCE"
+
+    if [[ "$use_filters" == "true" ]]; then
+        echo "Mode: bare clone (filters active)"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY RUN] git clone --bare \"$SOURCE\" \"$CLONE_DIR\""
+            echo "[DRY RUN] Performing actual clone for dry-run ref inspection..."
+        fi
+        if ! git clone --bare "$source_url" "$CLONE_DIR"; then
+            echo "Error: Failed to clone source repository" >&2
+            exit 1
+        fi
+    else
+        echo "Mode: mirror (all refs)"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[DRY RUN] git clone --mirror \"$SOURCE\" \"$CLONE_DIR\""
+            echo "[DRY RUN] Performing actual clone for dry-run ref inspection..."
+        fi
+        if ! git clone --mirror "$source_url" "$CLONE_DIR"; then
+            echo "Error: Failed to clone source repository" >&2
+            exit 1
+        fi
+    fi
+
+    echo "Clone completed successfully"
+}
+
+push_target() {
+    local target_url="$TARGET"
+
+    if [[ -n "$TARGET_USER" && -n "$TARGET_TOKEN" ]]; then
+        target_url=$(inject_credentials "$TARGET" "$TARGET_USER" "$TARGET_TOKEN")
+        echo "Using HTTPS credentials for target push"
+    fi
+
+    echo "Pushing to target repository..."
+    echo "Target: $TARGET"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        push_target_dry_run "$target_url"
+        return
+    fi
+
+    local has_filters="false"
+    if [[ ${#BRANCHES[@]} -gt 0 || ${#TAGS[@]} -gt 0 ]]; then
+        has_filters="true"
+    fi
+
+    if [[ "$has_filters" == "false" ]]; then
+        echo "Mode: mirror push (all refs)"
+        if ! git -C "$CLONE_DIR" push --mirror "$target_url"; then
+            echo "Error: Failed to push to target repository" >&2
+            exit 1
+        fi
+    else
+        push_filtered "$target_url"
+    fi
+
+    echo "Push completed successfully"
+
+    if [[ "$KEEP_LOCAL" == "true" && -d "$CLONE_DIR" ]]; then
+        if git -C "$CLONE_DIR" remote get-url origin >/dev/null 2>&1; then
+            git -C "$CLONE_DIR" remote set-url origin "$SOURCE"
+            echo "Stripped credentials from clone config"
+        fi
+    fi
+}
+
+push_filtered() {
+    local target_url="$1"
+
+    echo "Mode: filtered push"
+    local failed_refs=()
+
+    if [[ ${#BRANCHES[@]} -gt 0 ]]; then
+        echo "Pushing matching branches..."
+        local branches_found=0
+
+        while IFS= read -r ref; do
+            local branch="${ref#refs/heads/}"
+            for pattern in "${BRANCHES[@]}"; do
+                if [[ "$branch" == $pattern ]]; then
+                    echo "  Pushing branch: $branch"
+                    if ! git -C "$CLONE_DIR" push "$target_url" "$ref:refs/heads/$branch"; then
+                        echo "Error: Failed to push branch '$branch'" >&2
+                        failed_refs+=("branch:$branch")
+                    else
+                        branches_found=$((branches_found + 1))
+                    fi
+                    break
+                fi
+            done
+        done < <(git -C "$CLONE_DIR" for-each-ref --format='%(refname)' refs/heads/)
+
+        if [[ $branches_found -eq 0 ]]; then
+            echo "  Warning: No branches matched the given patterns"
+        else
+            echo "  Pushed $branches_found branch(es)"
+        fi
+    fi
+
+    if [[ ${#TAGS[@]} -gt 0 ]]; then
+        echo "Pushing matching tags..."
+        local tags_found=0
+
+        while IFS= read -r ref; do
+            local tag="${ref#refs/tags/}"
+            for pattern in "${TAGS[@]}"; do
+                if [[ "$tag" == $pattern ]]; then
+                    echo "  Pushing tag: $tag"
+                    if ! git -C "$CLONE_DIR" push "$target_url" "$ref:refs/tags/$tag"; then
+                        echo "Error: Failed to push tag '$tag'" >&2
+                        failed_refs+=("tag:$tag")
+                    else
+                        tags_found=$((tags_found + 1))
+                    fi
+                    break
+                fi
+            done
+        done < <(git -C "$CLONE_DIR" for-each-ref --format='%(refname)' refs/tags/)
+
+        if [[ $tags_found -eq 0 ]]; then
+            echo "  Warning: No tags matched the given patterns"
+        else
+            echo "  Pushed $tags_found tag(s)"
+        fi
+    fi
+
+    if [[ ${#failed_refs[@]} -gt 0 ]]; then
+        echo "Error: Failed to push the following refs:" >&2
+        for failed in "${failed_refs[@]}"; do
+            echo "  - $failed" >&2
+        done
+        exit 1
+    fi
+}
+
+push_target_dry_run() {
+    local target_url="$1"
+
+    if [[ ${#BRANCHES[@]} -gt 0 || ${#TAGS[@]} -gt 0 ]]; then
+        echo "[DRY RUN] Filtered push to: $TARGET"
+
+        if [[ ${#BRANCHES[@]} -gt 0 ]]; then
+            echo "[DRY RUN] Branch patterns: ${BRANCHES[*]}"
+            while IFS= read -r ref; do
+                local branch="${ref#refs/heads/}"
+                for pattern in "${BRANCHES[@]}"; do
+                    if [[ "$branch" == $pattern ]]; then
+                        echo "[DRY RUN]   Would push branch: $branch"
+                        break
+                    fi
+                done
+            done < <(git -C "$CLONE_DIR" for-each-ref --format='%(refname)' refs/heads/)
+        fi
+
+        if [[ ${#TAGS[@]} -gt 0 ]]; then
+            echo "[DRY RUN] Tag patterns: ${TAGS[*]}"
+            while IFS= read -r ref; do
+                local tag="${ref#refs/tags/}"
+                for pattern in "${TAGS[@]}"; do
+                    if [[ "$tag" == $pattern ]]; then
+                        echo "[DRY RUN]   Would push tag: $tag"
+                        break
+                    fi
+                done
+            done < <(git -C "$CLONE_DIR" for-each-ref --format='%(refname)' refs/tags/)
+        fi
+    else
+        echo "[DRY RUN] git push --mirror \"$TARGET\""
+    fi
+}
+
+main() {
+    validate_dependencies
+    validate_parameters
+    setup_ssh
+
+    echo "Git Mirror Repo Utility"
+    echo "======================="
+    echo "Source: $SOURCE"
+    echo "Target: $TARGET"
+
+    if [[ ${#BRANCHES[@]} -gt 0 ]]; then
+        echo "Branch filters: ${BRANCHES[*]}"
+    fi
+    if [[ ${#TAGS[@]} -gt 0 ]]; then
+        echo "Tag filters: ${TAGS[*]}"
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "Dry run: no changes will be made"
+    fi
+
+    echo ""
+
+    clone_source
+    echo ""
+    push_target
+
+    echo ""
+    echo "Mirror operation completed successfully at $(date)"
+}
+
+main "$@"
