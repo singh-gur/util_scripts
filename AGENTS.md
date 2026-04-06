@@ -57,6 +57,27 @@ shellcheck script_name
 shellcheck pg_s3_backup mount_nas setup_local_k8s
 ```
 
+### Container Build
+```bash
+# Build the toolbox image locally
+docker build -t util_scripts:local .
+
+# Start an interactive shell with the packaged scripts available on PATH
+docker run --rm -it util_scripts:local
+```
+
+### Concourse Pipeline
+```bash
+# Copy the example credentials file and fill in the values
+cp ci/credentials.yml.example ci/credentials.yml
+
+# Set the pipeline on an existing fly target
+./ci/set-pipeline.sh deploy
+
+# Manual fly alternative
+fly -t deploy set-pipeline -p util-scripts -c ci/pipeline.yml -l ci/credentials.yml
+```
+
 ## Code Style Guidelines
 
 ### Shell Script Standards

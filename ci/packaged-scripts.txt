@@ -1,0 +1,16 @@
+fix_via_access
+git_mirror_repo
+init_gh_repo
+install_go
+install_nvim
+install_plex
+install_zig
+install_zls
+mount_nas
+pg_create_db_user
+pg_s3_backup
+pg_s3_restore
+s3_sync
+screen_config
+setup_local_k8s
+ssh_proxy
