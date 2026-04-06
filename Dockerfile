@@ -27,11 +27,11 @@ WORKDIR /workspace
 
 COPY . /src
 
-RUN while IFS= read -r script; do \
-        if [ -n "$script" ]; then \
-            install -m 0755 "/src/$script" "/usr/local/bin/$script"; \
+RUN for script in /src/*; do \
+        if [ -f "$script" ] && [ -x "$script" ]; then \
+            install -m 0755 "$script" "/usr/local/bin/$(basename "$script")"; \
         fi; \
-    done < /src/ci/packaged-scripts.txt && \
+    done && \
     rm -rf /src
 
 CMD ["bash"]

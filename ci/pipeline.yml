@@ -43,11 +43,11 @@ jobs:
               - |
                 apk add --no-cache bash
 
-                while IFS= read -r script; do
-                  if [ -n "$script" ]; then
-                    bash -n "repo/$script"
+                for script in repo/*; do
+                  if [ -f "$script" ] && [ -x "$script" ]; then
+                    bash -n "$script"
                   fi
-                done < repo/ci/packaged-scripts.txt
+                done
 
                 bash -n repo/ci/scripts/generate-tags.sh
                 bash -n repo/ci/set-pipeline.sh

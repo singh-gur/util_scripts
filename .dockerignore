@@ -2,4 +2,4 @@
 .gitignore
 .ignore
 .vscode
-ci/credentials.yml
+ci
