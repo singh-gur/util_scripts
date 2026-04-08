@@ -18,6 +18,7 @@ TAGS=()
 TEMP_DIR="/tmp"
 KEEP_LOCAL="false"
 DRY_RUN="false"
+STRICT="false"
 
 CLONE_DIR=""
 
@@ -85,6 +86,7 @@ Options:
   --temp-dir DIR          Temporary directory for clone (default: $TEMP_DIR)
   --keep-local            Keep cloned repository after push
   --dry-run               Show what would be done without making changes
+  --strict                Fail if any target ref push fails
   -h, --help              Show this help message
 
 Examples:
@@ -199,6 +201,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             DRY_RUN="true"
+            shift
+            ;;
+        --strict)
+            STRICT="true"
             shift
             ;;
         -h|--help)
@@ -382,8 +388,12 @@ push_target() {
     if [[ "$has_filters" == "false" ]]; then
         echo "Mode: mirror push (all refs)"
         if ! git -C "$CLONE_DIR" push --mirror "$target_url"; then
-            echo "Error: Failed to push to target repository" >&2
-            exit 1
+            if [[ "$STRICT" == "true" ]]; then
+                echo "Error: Failed to push to target repository" >&2
+                exit 1
+            else
+                echo "Warning: Failed to push some refs to target repository" >&2
+            fi
         fi
     else
         push_filtered "$target_url"
@@ -402,7 +412,11 @@ push_target() {
 push_filtered() {
     local target_url="$1"
 
-    echo "Mode: filtered push"
+    if [[ "$STRICT" == "true" ]]; then
+        echo "Mode: filtered push (strict)"
+    else
+        echo "Mode: filtered push"
+    fi
     local failed_refs=()
 
     if [[ ${#BRANCHES[@]} -gt 0 ]]; then
@@ -460,11 +474,17 @@ push_filtered() {
     fi
 
     if [[ ${#failed_refs[@]} -gt 0 ]]; then
-        echo "Error: Failed to push the following refs:" >&2
+        if [[ "$STRICT" == "true" ]]; then
+            echo "Error: Failed to push the following refs:" >&2
+        else
+            echo "Warning: Failed to push the following refs:" >&2
+        fi
         for failed in "${failed_refs[@]}"; do
             echo "  - $failed" >&2
         done
-        exit 1
+        if [[ "$STRICT" == "true" ]]; then
+            exit 1
+        fi
     fi
 }
 
@@ -523,6 +543,9 @@ main() {
 
     if [[ "$DRY_RUN" == "true" ]]; then
         echo "Dry run: no changes will be made"
+    fi
+    if [[ "$STRICT" == "true" ]]; then
+        echo "Strict mode: enabled"
     fi
 
     echo ""
