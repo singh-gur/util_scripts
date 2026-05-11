@@ -1,0 +1,544 @@
+#!/bin/bash
+
+set -e
+set -u
+set -o pipefail
+
+SCRIPT_NAME=$(basename "$0")
+
+SOURCE_IMAGE=""
+TARGET_IMAGE=""
+SOURCE_USER="${SOURCE_REGISTRY_USER:-}"
+SOURCE_TOKEN="${SOURCE_REGISTRY_TOKEN:-}"
+SOURCE_TOKEN_FILE="${SOURCE_REGISTRY_TOKEN_FILE:-}"
+TARGET_USER="${TARGET_REGISTRY_USER:-}"
+TARGET_TOKEN="${TARGET_REGISTRY_TOKEN:-}"
+TARGET_TOKEN_FILE="${TARGET_REGISTRY_TOKEN_FILE:-}"
+VPN=false
+VPN_COUNTRY=""
+VPN_TIMEOUT=60
+PLATFORM=""
+DRY_RUN=false
+CLEANUP=false
+VERBOSE=false
+TEMP_DIR=""
+AUTH_FILE=""
+
+cleanup() {
+    local exit_code=$?
+
+    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+    fi
+
+    exit $exit_code
+}
+
+trap cleanup EXIT
+
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_error() {
+    echo "[ERROR] $1" >&2
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "[VERBOSE] $1"
+    fi
+}
+
+usage() {
+    cat << EOF
+usage: $SCRIPT_NAME SOURCE_IMAGE TARGET_IMAGE [options]
+
+Copy a container image from one registry to another using skopeo. This is
+Kubernetes-friendly because it does not require a Docker daemon or privileged
+pod. Optionally logs in to source and target registries and can connect NordVPN
+before syncing.
+
+Arguments:
+  SOURCE_IMAGE              Image to copy, e.g. docker.io/library/nginx:1.27
+  TARGET_IMAGE              Image to push, e.g. registry.example.com/me/nginx:1.27
+
+Authentication:
+  --source-user USER        Username for source registry login
+  --source-token TOKEN      Password/token for source registry login
+  --source-token-file FILE  Read source registry password/token from file
+  --target-user USER        Username for target registry login
+  --target-token TOKEN      Password/token for target registry login
+  --target-token-file FILE  Read target registry password/token from file
+
+Environment authentication defaults:
+  SOURCE_REGISTRY_USER, SOURCE_REGISTRY_TOKEN, SOURCE_REGISTRY_TOKEN_FILE
+  TARGET_REGISTRY_USER, TARGET_REGISTRY_TOKEN, TARGET_REGISTRY_TOKEN_FILE
+
+VPN:
+  --vpn                     Use NordVPN; connect if not already connected
+  --vpn-country COUNTRY     NordVPN country/server group to connect to
+  --vpn-timeout SECONDS     Seconds to wait for VPN connection (default: $VPN_TIMEOUT)
+
+Options:
+  --platform PLATFORM       Platform to copy, e.g. linux/amd64 or linux/arm64/v8
+  --cleanup                 Accepted for compatibility; no-op with skopeo
+  --dry-run                 Show commands without making changes
+  -v, --verbose             Enable verbose output
+  -h, --help                Show this help message
+
+Examples:
+  $SCRIPT_NAME nginx:1.27 registry.example.com/me/nginx:1.27
+
+  $SCRIPT_NAME ghcr.io/source/app:latest registry.example.com/me/app:latest --source-user source-user --target-user target-user --target-token-file /var/run/secrets/target-token
+
+  $SCRIPT_NAME alpine:latest registry.example.com/me/alpine:latest --platform linux/amd64
+
+EOF
+}
+
+format_command() {
+    local cmd=""
+    local arg=""
+    local escaped=""
+
+    for arg in "$@"; do
+        printf -v escaped "%q" "$arg"
+        cmd+="$escaped "
+    done
+
+    echo "${cmd% }"
+}
+
+run_cmd() {
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[DRY-RUN] $(format_command "$@")"
+    else
+        log_verbose "Running: $(format_command "$@")"
+        "$@"
+    fi
+}
+
+require_value() {
+    local option="$1"
+    local remaining="$2"
+
+    if [[ "$remaining" -lt 2 ]]; then
+        log_error "Missing value for $option"
+        exit 1
+    fi
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --source-user)
+                require_value "$1" "$#"
+                SOURCE_USER="$2"
+                shift 2
+                ;;
+            --source-user=*)
+                SOURCE_USER="${1#*=}"
+                shift
+                ;;
+            --source-token)
+                require_value "$1" "$#"
+                SOURCE_TOKEN="$2"
+                shift 2
+                ;;
+            --source-token=*)
+                SOURCE_TOKEN="${1#*=}"
+                shift
+                ;;
+            --source-token-file)
+                require_value "$1" "$#"
+                SOURCE_TOKEN_FILE="$2"
+                shift 2
+                ;;
+            --source-token-file=*)
+                SOURCE_TOKEN_FILE="${1#*=}"
+                shift
+                ;;
+            --target-user)
+                require_value "$1" "$#"
+                TARGET_USER="$2"
+                shift 2
+                ;;
+            --target-user=*)
+                TARGET_USER="${1#*=}"
+                shift
+                ;;
+            --target-token)
+                require_value "$1" "$#"
+                TARGET_TOKEN="$2"
+                shift 2
+                ;;
+            --target-token=*)
+                TARGET_TOKEN="${1#*=}"
+                shift
+                ;;
+            --target-token-file)
+                require_value "$1" "$#"
+                TARGET_TOKEN_FILE="$2"
+                shift 2
+                ;;
+            --target-token-file=*)
+                TARGET_TOKEN_FILE="${1#*=}"
+                shift
+                ;;
+            --vpn)
+                VPN=true
+                shift
+                ;;
+            --vpn-country)
+                require_value "$1" "$#"
+                VPN_COUNTRY="$2"
+                shift 2
+                ;;
+            --vpn-country=*)
+                VPN_COUNTRY="${1#*=}"
+                shift
+                ;;
+            --vpn-timeout)
+                require_value "$1" "$#"
+                VPN_TIMEOUT="$2"
+                shift 2
+                ;;
+            --vpn-timeout=*)
+                VPN_TIMEOUT="${1#*=}"
+                shift
+                ;;
+            --platform)
+                require_value "$1" "$#"
+                PLATFORM="$2"
+                shift 2
+                ;;
+            --platform=*)
+                PLATFORM="${1#*=}"
+                shift
+                ;;
+            --cleanup)
+                CLEANUP=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -* )
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [[ -z "$SOURCE_IMAGE" ]]; then
+                    SOURCE_IMAGE="$1"
+                elif [[ -z "$TARGET_IMAGE" ]]; then
+                    TARGET_IMAGE="$1"
+                else
+                    log_error "Unexpected argument: $1"
+                    usage
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+}
+
+validate_args() {
+    local os=""
+    local arch=""
+    local variant=""
+    local extra=""
+
+    if [[ -z "$SOURCE_IMAGE" || -z "$TARGET_IMAGE" ]]; then
+        log_error "SOURCE_IMAGE and TARGET_IMAGE are required"
+        usage
+        exit 1
+    fi
+
+    if [[ -n "$SOURCE_TOKEN" && -z "$SOURCE_USER" ]]; then
+        log_error "--source-token requires --source-user"
+        exit 1
+    fi
+
+    if [[ -n "$SOURCE_TOKEN_FILE" && -z "$SOURCE_USER" ]]; then
+        log_error "--source-token-file requires --source-user"
+        exit 1
+    fi
+
+    if [[ -n "$TARGET_TOKEN" && -z "$TARGET_USER" ]]; then
+        log_error "--target-token requires --target-user"
+        exit 1
+    fi
+
+    if [[ -n "$TARGET_TOKEN_FILE" && -z "$TARGET_USER" ]]; then
+        log_error "--target-token-file requires --target-user"
+        exit 1
+    fi
+
+    if ! [[ "$VPN_TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$VPN_TIMEOUT" -eq 0 ]]; then
+        log_error "--vpn-timeout must be a positive integer"
+        exit 1
+    fi
+
+    if [[ -n "$PLATFORM" ]]; then
+        IFS=/ read -r os arch variant extra <<< "$PLATFORM"
+        if [[ -z "$os" || -z "$arch" || -n "$extra" ]]; then
+            log_error "--platform must use OS/ARCH or OS/ARCH/VARIANT format"
+            exit 1
+        fi
+    fi
+}
+
+validate_dependencies() {
+    local missing_deps=()
+
+    if [[ "$DRY_RUN" != true ]] && ! command -v skopeo >/dev/null 2>&1; then
+        missing_deps+=("skopeo")
+    fi
+
+    if [[ "$VPN" == true && "$DRY_RUN" != true ]] && ! command -v nordvpn >/dev/null 2>&1; then
+        missing_deps+=("nordvpn")
+    fi
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing_deps[*]}"
+        exit 1
+    fi
+}
+
+image_registry() {
+    local image="$1"
+    local first_part="${image%%/*}"
+
+    if [[ "$image" != */* ]]; then
+        echo "docker.io"
+        return
+    fi
+
+    if [[ "$first_part" == "localhost" || "$first_part" == *.* || "$first_part" == *:* ]]; then
+        echo "$first_part"
+    else
+        echo "docker.io"
+    fi
+}
+
+ensure_auth_file() {
+    if [[ -n "$AUTH_FILE" ]]; then
+        return
+    fi
+
+    TEMP_DIR=$(mktemp -d "/tmp/${SCRIPT_NAME}.XXXXXX")
+    AUTH_FILE="$TEMP_DIR/auth.json"
+    touch "$AUTH_FILE"
+    chmod 600 "$AUTH_FILE"
+}
+
+resolve_token() {
+    local label="$1"
+    local user="$2"
+    local token="$3"
+    local token_file="$4"
+
+    if [[ -z "$token" && -n "$token_file" ]]; then
+        if [[ ! -f "$token_file" ]]; then
+            log_error "$label registry token file does not exist: $token_file"
+            return 1
+        fi
+
+        token=$(<"$token_file")
+    fi
+
+    if [[ -n "$user" && -z "$token" ]]; then
+        if [[ ! -t 0 ]]; then
+            log_error "No password/token provided for $label registry login and stdin is not interactive"
+            return 1
+        fi
+
+        printf "Enter %s registry password/token for %s: " "$label" "$user" >&2
+        read -r -s token
+        printf '\n' >&2
+    fi
+
+    printf '%s' "$token"
+}
+
+skopeo_login_if_requested() {
+    local label="$1"
+    local registry="$2"
+    local user="$3"
+    local token="$4"
+    local token_file="$5"
+
+    if [[ -z "$user" ]]; then
+        log_verbose "No $label registry login requested"
+        return
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[DRY-RUN] skopeo login --authfile <temp-authfile> --username $user --password-stdin $registry"
+        return
+    fi
+
+    if ! token=$(resolve_token "$label" "$user" "$token" "$token_file"); then
+        exit 1
+    fi
+
+    if [[ -z "$token" ]]; then
+        log_error "No password/token provided for $label registry login"
+        exit 1
+    fi
+
+    ensure_auth_file
+    log_info "Logging in to $label registry: $registry"
+    if ! printf '%s\n' "$token" | skopeo login --authfile "$AUTH_FILE" --username "$user" --password-stdin "$registry"; then
+        log_error "Registry login failed for $label registry: $registry"
+        exit 1
+    fi
+}
+
+vpn_is_connected() {
+    local status_output=""
+
+    if ! status_output=$(nordvpn status 2>&1); then
+        log_error "Unable to check NordVPN status"
+        echo "$status_output" >&2
+        return 2
+    fi
+
+    log_verbose "$status_output"
+
+    if grep -qi "Status:[[:space:]]*Connected" <<< "$status_output"; then
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_vpn_connected() {
+    local status_code=0
+    local elapsed=0
+    local connect_cmd=(nordvpn connect)
+
+    if [[ "$VPN" != true ]]; then
+        return
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[DRY-RUN] nordvpn status"
+        if [[ -n "$VPN_COUNTRY" ]]; then
+            echo "[DRY-RUN] nordvpn connect $VPN_COUNTRY"
+        else
+            echo "[DRY-RUN] nordvpn connect"
+        fi
+        return
+    fi
+
+    if vpn_is_connected; then
+        log_info "NordVPN is already connected"
+        return
+    else
+        status_code=$?
+    fi
+
+    if [[ "$status_code" -ne 1 ]]; then
+        exit 1
+    fi
+
+    if [[ -n "$VPN_COUNTRY" ]]; then
+        connect_cmd+=("$VPN_COUNTRY")
+    fi
+
+    log_info "NordVPN is not connected; connecting now"
+    run_cmd "${connect_cmd[@]}"
+
+    while true; do
+        if vpn_is_connected; then
+            log_info "NordVPN connected"
+            return
+        else
+            status_code=$?
+        fi
+
+        if [[ "$status_code" -ne 1 ]]; then
+            exit 1
+        fi
+
+        if [[ "$elapsed" -ge "$VPN_TIMEOUT" ]]; then
+            log_error "Timed out waiting for NordVPN to connect"
+            exit 1
+        fi
+
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+}
+
+add_platform_args() {
+    local -n cmd_ref=$1
+    local os=""
+    local arch=""
+    local variant=""
+
+    if [[ -z "$PLATFORM" ]]; then
+        return
+    fi
+
+    IFS=/ read -r os arch variant <<< "$PLATFORM"
+    cmd_ref+=(--override-os "$os" --override-arch "$arch")
+
+    if [[ -n "$variant" ]]; then
+        cmd_ref+=(--override-variant "$variant")
+    fi
+}
+
+sync_image() {
+    local copy_cmd=(skopeo copy)
+
+    if [[ -n "$AUTH_FILE" ]]; then
+        copy_cmd+=(--authfile "$AUTH_FILE")
+    fi
+
+    add_platform_args copy_cmd
+    copy_cmd+=("docker://$SOURCE_IMAGE" "docker://$TARGET_IMAGE")
+
+    log_info "Copying image: $SOURCE_IMAGE -> $TARGET_IMAGE"
+    run_cmd "${copy_cmd[@]}"
+
+    if [[ "$CLEANUP" == true ]]; then
+        log_info "No cleanup needed; skopeo does not store local image tags"
+    fi
+}
+
+main() {
+    local source_registry=""
+    local target_registry=""
+
+    parse_args "$@"
+    validate_args
+    validate_dependencies
+
+    source_registry=$(image_registry "$SOURCE_IMAGE")
+    target_registry=$(image_registry "$TARGET_IMAGE")
+
+    ensure_vpn_connected
+
+    skopeo_login_if_requested "source" "$source_registry" "$SOURCE_USER" "$SOURCE_TOKEN" "$SOURCE_TOKEN_FILE"
+    skopeo_login_if_requested "target" "$target_registry" "$TARGET_USER" "$TARGET_TOKEN" "$TARGET_TOKEN_FILE"
+
+    sync_image
+
+    log_info "Image sync complete"
+}
+
+main "$@"

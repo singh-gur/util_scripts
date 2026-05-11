@@ -12,6 +12,7 @@ This is a collection of Bash utility scripts for system administration, DevOps, 
 - Language tooling installation (Go, Zig, Neovim)
 - SSH proxy/jump host management
 - S3 synchronization utilities
+- Container image registry synchronization with skopeo
 
 ## Build/Lint/Test Commands
 
@@ -43,6 +44,7 @@ bash -n script_name
 ./pg_s3_backup --help
 ./mount_nas --help
 ./s3_sync --dry-run ./test s3://bucket/test
+./sync_oci_image alpine:latest registry.example.com/me/alpine:latest --dry-run
 ```
 
 ### Validation
@@ -54,7 +56,7 @@ done
 
 # Use shellcheck if available (recommended)
 shellcheck script_name
-shellcheck pg_s3_backup mount_nas setup_local_k8s
+shellcheck pg_s3_backup mount_nas setup_local_k8s sync_oci_image
 ```
 
 ### Container Build

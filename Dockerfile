@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     postgresql-client \
     procps \
+    skopeo \
     tmux \
     unzip \
     wget \
