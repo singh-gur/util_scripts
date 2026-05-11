@@ -364,6 +364,16 @@ clone_source() {
     echo "Clone completed successfully"
 }
 
+validate_target_access() {
+    local target_url="$1"
+
+    echo "Validating target repository access..."
+    if ! git ls-remote "$target_url" >/dev/null 2>&1; then
+        echo "Error: Target repository is not accessible. Check that it exists and that target authentication is valid." >&2
+        exit 1
+    fi
+}
+
 push_target() {
     local target_url="$TARGET"
 
@@ -379,6 +389,8 @@ push_target() {
         push_target_dry_run "$target_url"
         return
     fi
+
+    validate_target_access "$target_url"
 
     local has_filters="false"
     if [[ ${#BRANCHES[@]} -gt 0 || ${#TAGS[@]} -gt 0 ]]; then
