@@ -30,8 +30,10 @@ jobs:
           image_resource:
             type: registry-image
             source:
-              repository: alpine
+              repository: git.gsingh.io/common/alpine
               tag: latest
+              username: ((git_registry_username))
+              password: ((git_registry_password))
 
           inputs:
             - name: repo
@@ -65,8 +67,10 @@ jobs:
           image_resource:
             type: registry-image
             source:
-              repository: alpine/git
+              repository: git.gsingh.io/common/alpine/git
               tag: latest
+              username: ((git_registry_username))
+              password: ((git_registry_password))
 
           inputs:
             - name: repo
@@ -89,8 +93,10 @@ jobs:
           image_resource:
             type: registry-image
             source:
-              repository: concourse/oci-build-task
+              repository: git.gsingh.io/common/concourse/oci-build-task
               tag: latest
+              username: ((git_registry_username))
+              password: ((git_registry_password))
 
           inputs:
             - name: repo
@@ -116,8 +122,10 @@ jobs:
           image_resource:
             type: registry-image
             source:
-              repository: alpine
+              repository: git.gsingh.io/common/alpine
               tag: latest
+              username: ((git_registry_username))
+              password: ((git_registry_password))
 
           inputs:
             - name: tags
