@@ -340,7 +340,7 @@ ensure_auth_file() {
 
     TEMP_DIR=$(mktemp -d "/tmp/${SCRIPT_NAME}.XXXXXX")
     AUTH_FILE="$TEMP_DIR/auth.json"
-    touch "$AUTH_FILE"
+    printf '{}\n' > "$AUTH_FILE"
     chmod 600 "$AUTH_FILE"
 }
 
