@@ -5,6 +5,7 @@ This document provides guidelines for AI coding agents working in this repositor
 ## Repository Overview
 
 This is a collection of Bash utility scripts for system administration, DevOps, and automation tasks including:
+
 - PostgreSQL backup/restore to S3
 - NAS/NFS mounting utilities
 - Kubernetes/Minikube setup with ArgoCD
@@ -17,9 +18,11 @@ This is a collection of Bash utility scripts for system administration, DevOps, 
 ## Build/Lint/Test Commands
 
 ### No Build System
+
 This repository contains standalone Bash scripts with no build process. Scripts are executed directly.
 
 ### Running Scripts
+
 ```bash
 # Make script executable (if needed)
 chmod +x script_name
@@ -32,6 +35,7 @@ bash script_name [options]
 ```
 
 ### Testing Individual Scripts
+
 ```bash
 # Syntax check
 bash -n script_name
@@ -48,6 +52,7 @@ bash -n script_name
 ```
 
 ### Validation
+
 ```bash
 # Check shell syntax for all scripts
 for script in *; do
@@ -60,6 +65,7 @@ shellcheck pg_s3_backup mount_nas setup_local_k8s sync_oci_image
 ```
 
 ### Container Build
+
 ```bash
 # Build the toolbox image locally
 docker build -t util_scripts:local .
@@ -69,6 +75,7 @@ docker run --rm -it util_scripts:local
 ```
 
 ### Concourse Pipeline
+
 ```bash
 # Copy the example credentials file and fill in the values
 cp ci/credentials.yml.example ci/credentials.yml
@@ -85,6 +92,7 @@ fly -t deploy set-pipeline -p util-scripts -c ci/pipeline.yml -l ci/credentials.
 ### Shell Script Standards
 
 #### Shebang and Shell Options
+
 - **Always** use `#!/bin/bash` as the shebang (line 1)
 - **Always** include safety flags early in the script:
   ```bash
@@ -95,6 +103,7 @@ fly -t deploy set-pipeline -p util-scripts -c ci/pipeline.yml -l ci/credentials.
 - Alternative verbose mode: `set +v` (use when you want to suppress verbose output)
 
 #### Variable Naming
+
 - Use **UPPERCASE** for global configuration variables and constants
   ```bash
   HOST="localhost"
@@ -110,6 +119,7 @@ fly -t deploy set-pipeline -p util-scripts -c ci/pipeline.yml -l ci/credentials.
 - Use descriptive names: `SOURCE_BASE` not `SB`, `TARGET_PATH` not `TP`
 
 #### Quoting
+
 - **Always** quote variable expansions: `"$VAR"` not `$VAR`
 - Quote paths that may contain spaces: `"$TARGET_PATH"` `"$SSH_KEY"`
 - Exception: Arrays and word splitting when intentional
@@ -117,12 +127,13 @@ fly -t deploy set-pipeline -p util-scripts -c ci/pipeline.yml -l ci/credentials.
 #### Functions
 
 **Function Declaration Style:**
+
 ```bash
 # Preferred style (seen in most scripts)
 function_name() {
     local param1="$1"
     local param2="$2"
-    
+
     # function body
 }
 
@@ -133,21 +144,23 @@ function function_name() {
 ```
 
 **Function Organization:**
+
 1. Helper/utility functions first
 2. Validation functions
 3. Core business logic functions
 4. Main function last
 
 **Common Function Patterns:**
+
 ```bash
 # Validation function
 validate_dependencies() {
     local missing_deps=()
-    
+
     if ! command -v tool_name >/dev/null 2>&1; then
         missing_deps+=("package-name")
     fi
-    
+
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         echo "Error: Missing required dependencies: ${missing_deps[*]}" >&2
         exit 1
@@ -184,6 +197,7 @@ trap cleanup EXIT
 #### Argument Parsing
 
 **Standard Pattern with Both Formats (= and space):**
+
 ```bash
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -217,6 +231,7 @@ done
 ```
 
 **Alternative Pattern (= only):**
+
 ```bash
 while [ "$1" != "" ]; do
     PARAM=$(echo $1 | awk -F= '{print $1}')
@@ -236,6 +251,7 @@ done
 #### Conditionals
 
 **Prefer `[[ ]]` over `[ ]`:**
+
 ```bash
 # Good
 if [[ -z "$VAR" ]]; then
@@ -253,6 +269,7 @@ if [[ ! -w "$path" ]]; then
 ```
 
 **Command existence checks:**
+
 ```bash
 if ! command -v tool_name &> /dev/null; then
     echo "Error: tool_name is not installed"
@@ -263,6 +280,7 @@ fi
 #### Error Handling
 
 **Standard Error Pattern:**
+
 ```bash
 # Always send errors to stderr
 echo "Error: message" >&2
@@ -283,6 +301,7 @@ fi
 ```
 
 **Cleanup Handlers:**
+
 ```bash
 CLEANUP_FILES=()
 
@@ -307,6 +326,7 @@ CLEANUP_FILES+=("$temp_file")
 #### Output and Logging
 
 **Echo statements:**
+
 ```bash
 # Informational output
 echo "Starting process..."
@@ -323,6 +343,7 @@ fi
 ```
 
 **Here Documents for Multi-line Output:**
+
 ```bash
 cat << EOF
 Multi-line
@@ -339,6 +360,7 @@ EOF
 #### AWS CLI Patterns
 
 **Authentication:**
+
 ```bash
 # Support both profile and inline credentials
 if [[ -n "$AWS_ACCESS_KEY_ID" ]]; then
@@ -359,6 +381,7 @@ fi
 #### Path Handling
 
 **Tilde expansion:**
+
 ```bash
 # Expand ~ to $HOME
 TARGET_BASE="${TARGET_BASE/#\~/$HOME}"
@@ -366,6 +389,7 @@ SSH_KEY="${SSH_KEY/#\~/$HOME}"
 ```
 
 **Path validation:**
+
 ```bash
 if [[ ! -d "$dir" ]]; then
     mkdir -p "$dir"
@@ -380,6 +404,7 @@ fi
 ## Documentation Standards
 
 ### Help/Usage Messages
+
 - Every script **must** have a `usage()` function
 - Include clear description of purpose
 - List all required and optional parameters
@@ -387,6 +412,7 @@ fi
 - Show default values where applicable
 
 ### Comments
+
 - Comment complex logic and non-obvious operations
 - Document why, not what (code shows what)
 - Keep comments concise and up-to-date
@@ -417,6 +443,7 @@ fi
 ## Files to Never Commit
 
 (See `.gitignore`)
+
 - `.vscode/` - Editor configurations
 - `.ignore` - Local ignore files
 - Credentials or secrets files
