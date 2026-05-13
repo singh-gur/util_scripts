@@ -1,0 +1,325 @@
+#!/bin/bash
+
+set -e
+set -u
+set -o pipefail
+
+# OpenCode Desktop Installer
+# Identifies the latest version from GitHub releases and installs the appropriate
+# deb or rpm package for the current system
+
+VERSION="1.0.0"
+SCRIPT_NAME=$(basename "$0")
+
+REPO_OWNER="anomalyco"
+REPO_NAME="opencode"
+GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+
+# Default configuration
+OC_VERSION=""
+FORCE=""
+AUTO_YES=false
+
+# Temporary files
+TEMP_DIR="/tmp/install_oc_desk_$$"
+mkdir -p "$TEMP_DIR"
+CLEANUP_FILES=()
+
+cleanup() {
+    local exit_code=$?
+    echo "Cleaning up temporary files..."
+    for file in "${CLEANUP_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            rm -f "$file"
+            echo "Removed: $file"
+        fi
+    done
+    rmdir "$TEMP_DIR" 2>/dev/null || true
+    exit "$exit_code"
+}
+
+trap cleanup EXIT
+
+# Logging functions
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_error() {
+    echo "[ERROR] $1" >&2
+}
+
+# Help function
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [options]
+
+Install OpenCode Desktop from GitHub releases.
+Automatically detects package format (deb/rpm) based on the current system.
+
+Options:
+  -v, --version VERSION   Specific version to install (default: latest)
+  -f, --force            Reinstall even if the same version is already installed
+  -y, --yes              Skip confirmation prompt
+  -h, --help             Show this help message
+
+Examples:
+  $SCRIPT_NAME                        # Install latest version
+  $SCRIPT_NAME --version=1.14.48      # Install specific version
+  $SCRIPT_NAME --force                # Reinstall even if up to date
+  $SCRIPT_NAME --yes                  # Skip confirmation
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -v|--version)
+                OC_VERSION="$2"
+                shift 2
+                ;;
+            --version=*)
+                OC_VERSION="${1#*=}"
+                shift
+                ;;
+            -f|--force)
+                FORCE="Y"
+                shift
+                ;;
+            -y|--yes)
+                AUTO_YES=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Validate required dependencies
+validate_dependencies() {
+    local missing_deps=()
+
+    if ! command -v curl &> /dev/null; then
+        missing_deps+=("curl")
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        missing_deps+=("jq")
+    fi
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing_deps[*]}"
+        log_error "Please install them and try again."
+        exit 1
+    fi
+}
+
+# Detect the package format (deb or rpm) based on the distro
+# Uses /etc/os-release for reliable detection, falls back to command presence
+detect_pkg_type() {
+    local distro_id=""
+
+    # Primary: check /etc/os-release ID and ID_LIKE fields
+    if [[ -f /etc/os-release ]]; then
+        distro_id=$(grep -E '^ID=' /etc/os-release 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+        local distro_id_like=""
+        distro_id_like=$(grep -E '^ID_LIKE=' /etc/os-release 2>/dev/null | cut -d'=' -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+
+        case "$distro_id" in
+            debian|ubuntu|linuxmint|pop|elementary|kali|parrot|raspbian|deepin)
+                echo "deb"
+                return
+                ;;
+            fedora|rhel|centos|rocky|alma|opensuse-leap|opensuse-tumbleweed|sles|ol|amzn)
+                echo "rpm"
+                return
+                ;;
+        esac
+
+        # Check ID_LIKE for distros that declare parentage
+        case "$distro_id_like" in
+            *debian*|*ubuntu*)
+                echo "deb"
+                return
+                ;;
+            *fedora*|*rhel*|*centos*|*suse*)
+                echo "rpm"
+                return
+                ;;
+        esac
+    fi
+
+    # Fallback: check which package manager command is available
+    if command -v dpkg &> /dev/null; then
+        echo "deb"
+    elif command -v rpm &> /dev/null; then
+        echo "rpm"
+    else
+        log_error "Cannot determine package format."
+        log_error "This script supports deb-based and rpm-based Linux systems only."
+        exit 1
+    fi
+}
+
+# Fetch the latest version from GitHub API
+fetch_latest_version() {
+    local version
+    version=$(curl -s "$GITHUB_API" | jq -r '.tag_name')
+
+    if [[ -z "$version" || "$version" == "null" ]]; then
+        log_error "Failed to fetch latest version from GitHub"
+        exit 1
+    fi
+
+    # Strip leading 'v' if present
+    version="${version#v}"
+    echo "$version"
+}
+
+# Build the download URL based on version and package type
+build_download_url() {
+    local version="$1"
+    local pkg_type="$2"
+
+    case "$pkg_type" in
+        deb)
+            echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${version}/opencode-desktop-linux-amd64.deb"
+            ;;
+        rpm)
+            echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${version}/opencode-desktop-linux-x86_64.rpm"
+            ;;
+        *)
+            log_error "Unsupported package type: $pkg_type"
+            exit 1
+            ;;
+    esac
+}
+
+# Get the filename from the download URL
+get_filename() {
+    local url="$1"
+    basename "$url"
+}
+
+# Check current installed version
+check_installed_version() {
+    local installed_version=""
+    local pkg_type
+    pkg_type=$(detect_pkg_type)
+
+    case "$pkg_type" in
+        deb)
+            installed_version=$(dpkg-query -W -f='${Version}' opencode-desktop 2>/dev/null || echo "")
+            ;;
+        rpm)
+            installed_version=$(rpm -q --queryformat '%{VERSION}' opencode-desktop 2>/dev/null || echo "")
+            ;;
+    esac
+
+    echo "$installed_version"
+}
+
+# Main function
+main() {
+    parse_args "$@"
+    validate_dependencies
+
+    local pkg_type
+    pkg_type=$(detect_pkg_type)
+
+    # Determine version to install
+    if [[ -z "$OC_VERSION" ]]; then
+        OC_VERSION=$(fetch_latest_version)
+        log_info "Latest version: $OC_VERSION"
+    else
+        log_info "Requested version: $OC_VERSION"
+    fi
+
+    # Check if already installed
+    if [[ -z "$FORCE" ]]; then
+        local installed_version
+        installed_version=$(check_installed_version)
+        if [[ -n "$installed_version" && "$installed_version" == "$OC_VERSION" ]]; then
+            log_info "OpenCode Desktop $OC_VERSION is already installed"
+            exit 0
+        fi
+        if [[ -n "$installed_version" ]]; then
+            log_info "Current installed version: $installed_version"
+        fi
+    fi
+
+    # Build download URL
+    local download_url
+    download_url=$(build_download_url "$OC_VERSION" "$pkg_type")
+
+    local filename
+    filename=$(get_filename "$download_url")
+    local download_path="${TEMP_DIR}/${filename}"
+
+    log_info "Package type: $pkg_type"
+    log_info "Download URL: $download_url"
+
+    # Confirm installation
+    if [[ "$AUTO_YES" != true ]]; then
+        echo ""
+        echo "Ready to install OpenCode Desktop v${OC_VERSION} (${pkg_type})"
+        read -r -p "Continue? [y/N] " response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            log_info "Installation cancelled"
+            exit 0
+        fi
+    fi
+
+    # Download the package
+    log_info "Downloading OpenCode Desktop v${OC_VERSION}..."
+    if ! curl -fSL -o "$download_path" "$download_url"; then
+        log_error "Download failed. Please verify the version exists at:"
+        log_error "$download_url"
+        exit 1
+    fi
+
+    CLEANUP_FILES+=("$download_path")
+
+    # Install the package
+    log_info "Installing OpenCode Desktop v${OC_VERSION}..."
+    case "$pkg_type" in
+        deb)
+            if ! sudo dpkg -i "$download_path"; then
+                log_info "Attempting to fix broken dependencies..."
+                sudo apt-get install -f -y
+            fi
+            ;;
+        rpm)
+            if command -v dnf &> /dev/null; then
+                if ! sudo dnf install -y "$download_path"; then
+                    log_error "DNF installation failed"
+                    exit 1
+                fi
+            elif command -v yum &> /dev/null; then
+                if ! sudo yum localinstall -y "$download_path"; then
+                    log_error "YUM installation failed"
+                    exit 1
+                fi
+            else
+                if ! sudo rpm -Uvh "$download_path"; then
+                    log_error "RPM installation failed"
+                    exit 1
+                fi
+            fi
+            ;;
+    esac
+
+    log_info "OpenCode Desktop v${OC_VERSION} installed successfully!"
+}
+
+main "$@"
