@@ -1,0 +1,363 @@
+#!/bin/bash
+set -euo pipefail
+
+DRY_RUN=false
+CONFIGURE_GIT=true
+HELPER_PATH=""
+PACKAGE_MANAGER=""
+
+usage() {
+    cat << EOF
+usage: setup_git_cred_manager [options]
+
+Install and configure Git's libsecret credential helper for HTTPS repositories.
+Supports Ubuntu/Debian-like and Fedora/RHEL-like Linux distributions.
+
+Options:
+  --helper-path PATH       Use an existing git-credential-libsecret binary
+  --package-manager NAME   Force package manager: apt, dnf, or yum
+  --no-config              Install/build the helper but do not modify git config
+  --dry-run                Print commands instead of running them
+  -h, --help               Show this help message
+
+Examples:
+  setup_git_cred_manager
+  setup_git_cred_manager --dry-run
+  setup_git_cred_manager --helper-path /usr/libexec/git-core/git-credential-libsecret
+
+Notes:
+  This configures: git config --global credential.helper <helper-path>
+  Credential storage requires a running Secret Service provider such as
+  GNOME Keyring, KWallet, or KeePassXC with Secret Service integration.
+EOF
+}
+
+print_command() {
+    printf '[DRY-RUN]'
+    printf ' %q' "$@"
+    printf '\n'
+}
+
+run() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        print_command "$@"
+    else
+        "$@"
+    fi
+}
+
+run_as_root() {
+    if [[ "$EUID" -eq 0 ]]; then
+        run "$@"
+        return
+    fi
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "Error: sudo is required when not running as root" >&2
+        exit 1
+    fi
+
+    run sudo "$@"
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --helper-path)
+                HELPER_PATH="$2"
+                shift 2
+                ;;
+            --helper-path=*)
+                HELPER_PATH="${1#*=}"
+                shift
+                ;;
+            --package-manager)
+                PACKAGE_MANAGER="$2"
+                shift 2
+                ;;
+            --package-manager=*)
+                PACKAGE_MANAGER="${1#*=}"
+                shift
+                ;;
+            --no-config)
+                CONFIGURE_GIT=false
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                echo "Use --help for usage information" >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+detect_package_manager() {
+    if [[ -n "$PACKAGE_MANAGER" ]]; then
+        case "$PACKAGE_MANAGER" in
+            apt|dnf|yum)
+                echo "$PACKAGE_MANAGER"
+                return
+                ;;
+            *)
+                echo "Error: unsupported package manager: $PACKAGE_MANAGER" >&2
+                exit 1
+                ;;
+        esac
+    fi
+
+    if [[ ! -r /etc/os-release ]]; then
+        echo "Error: cannot detect Linux distribution; /etc/os-release is missing" >&2
+        exit 1
+    fi
+
+    # shellcheck source=/dev/null
+    source /etc/os-release
+    local distro_ids=" ${ID:-} ${ID_LIKE:-} "
+
+    if [[ "$distro_ids" == *" ubuntu "* || "$distro_ids" == *" debian "* ]]; then
+        echo "apt"
+    elif [[ "$distro_ids" == *" fedora "* || "$distro_ids" == *" rhel "* || "$distro_ids" == *" centos "* || "$distro_ids" == *" rocky "* || "$distro_ids" == *" almalinux "* ]]; then
+        if command -v dnf >/dev/null 2>&1; then
+            echo "dnf"
+        elif command -v yum >/dev/null 2>&1; then
+            echo "yum"
+        else
+            echo "Error: Fedora/RHEL-like system detected but dnf/yum was not found" >&2
+            exit 1
+        fi
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
+    else
+        echo "Error: unsupported distribution. Expected Ubuntu/Debian-like or Fedora/RHEL-like Linux." >&2
+        exit 1
+    fi
+}
+
+install_packages() {
+    local package_manager="$1"
+
+    echo "Installing Git libsecret credential helper dependencies using $package_manager..."
+
+    case "$package_manager" in
+        apt)
+            run_as_root apt-get update
+            run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                git \
+                libsecret-1-0 \
+                libsecret-1-dev \
+                build-essential \
+                pkg-config
+            ;;
+        dnf)
+            run_as_root dnf install -y \
+                git \
+                libsecret \
+                libsecret-devel \
+                gcc \
+                make \
+                pkgconf-pkg-config
+            ;;
+        yum)
+            run_as_root yum install -y \
+                git \
+                libsecret \
+                libsecret-devel \
+                gcc \
+                make \
+                pkgconfig
+            ;;
+        *)
+            echo "Error: unsupported package manager: $package_manager" >&2
+            exit 1
+            ;;
+    esac
+}
+
+install_helper_package_if_available() {
+    local package_manager="$1"
+
+    case "$package_manager" in
+        apt)
+            if command -v apt-cache >/dev/null 2>&1 && apt-cache show git-credential-libsecret >/dev/null 2>&1; then
+                run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y git-credential-libsecret
+            fi
+            ;;
+        dnf)
+            if ! run_as_root dnf install -y git-credential-libsecret; then
+                echo "git-credential-libsecret package was not available; will try building from Git contrib source." >&2
+            fi
+            ;;
+        yum)
+            if ! run_as_root yum install -y git-credential-libsecret; then
+                echo "git-credential-libsecret package was not available; will try building from Git contrib source." >&2
+            fi
+            ;;
+    esac
+}
+
+validate_helper_path() {
+    local helper_path="$1"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return
+    fi
+
+    if [[ ! -x "$helper_path" ]]; then
+        echo "Error: helper path is not executable: $helper_path" >&2
+        exit 1
+    fi
+}
+
+find_existing_helper() {
+    local git_exec_path=""
+    git_exec_path="$(git --exec-path 2>/dev/null || true)"
+
+    local candidates=(
+        "$git_exec_path/git-credential-libsecret"
+        "/usr/lib/git-core/git-credential-libsecret"
+        "/usr/libexec/git-core/git-credential-libsecret"
+        "/usr/share/doc/git/contrib/credential/libsecret/git-credential-libsecret"
+        "/usr/share/doc/git-core/contrib/credential/libsecret/git-credential-libsecret"
+        "/usr/share/git-core/contrib/credential/libsecret/git-credential-libsecret"
+    )
+
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [[ -x "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+build_helper_from_source() {
+    local source_dir="$1"
+
+    echo "Building git-credential-libsecret in: $source_dir" >&2
+
+    if [[ -w "$source_dir" ]]; then
+        run make -C "$source_dir" >&2
+    else
+        run_as_root make -C "$source_dir" >&2
+    fi
+}
+
+find_or_build_helper() {
+    local package_manager="$1"
+    local helper_path=""
+    if [[ -n "$HELPER_PATH" ]]; then
+        validate_helper_path "$HELPER_PATH"
+        echo "$HELPER_PATH"
+        return 0
+    fi
+
+    if helper_path="$(find_existing_helper)"; then
+        echo "$helper_path"
+        return 0
+    fi
+
+    local source_dirs=(
+        "/usr/share/doc/git/contrib/credential/libsecret"
+        "/usr/share/doc/git-core/contrib/credential/libsecret"
+        "/usr/share/git-core/contrib/credential/libsecret"
+    )
+
+    local source_dir
+    for source_dir in "${source_dirs[@]}" /usr/share/doc/git*/contrib/credential/libsecret; do
+        if [[ -d "$source_dir" && -f "$source_dir/Makefile" ]]; then
+            build_helper_from_source "$source_dir"
+            helper_path="$source_dir/git-credential-libsecret"
+
+            if [[ "$DRY_RUN" == "true" || -x "$helper_path" ]]; then
+                echo "$helper_path"
+                return 0
+            fi
+        fi
+    done
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        case "$package_manager" in
+            apt)
+                echo "/usr/share/doc/git/contrib/credential/libsecret/git-credential-libsecret"
+                ;;
+            dnf|yum)
+                echo "/usr/libexec/git-core/git-credential-libsecret"
+                ;;
+            *)
+                echo "git-credential-libsecret"
+                ;;
+        esac
+        return 0
+    fi
+
+    echo "Error: could not find or build git-credential-libsecret" >&2
+    echo "Expected source under /usr/share/doc/git*/contrib/credential/libsecret." >&2
+    exit 1
+}
+
+configure_git() {
+    local helper_path="$1"
+
+    if [[ "$CONFIGURE_GIT" != "true" ]]; then
+        echo "Skipping git config because --no-config was provided."
+        return
+    fi
+
+    echo "Configuring Git to use libsecret credential helper..."
+    run git config --global --replace-all credential.helper "$helper_path"
+}
+
+print_secret_service_note() {
+    if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        cat << EOF
+
+Note: no graphical/session bus environment was detected.
+The helper is installed, but saving credentials requires an unlocked Secret
+Service provider such as GNOME Keyring, KWallet, or KeePassXC.
+EOF
+    fi
+}
+
+main() {
+    parse_args "$@"
+
+    local package_manager
+    package_manager="$(detect_package_manager)"
+
+    install_packages "$package_manager"
+    install_helper_package_if_available "$package_manager"
+    if ! command -v git >/dev/null 2>&1 && [[ "$DRY_RUN" != "true" ]]; then
+        echo "Error: git is not installed or not available on PATH" >&2
+        exit 1
+    fi
+
+    local helper_path
+    helper_path="$(find_or_build_helper "$package_manager")"
+
+    configure_git "$helper_path"
+
+    if [[ "$CONFIGURE_GIT" == "true" ]]; then
+        echo "Git credential helper configured: $helper_path"
+        echo "Next time you push/pull over HTTPS, Git will store credentials via libsecret."
+    else
+        echo "Git credential helper ready: $helper_path"
+    fi
+    print_secret_service_note
+}
+
+main "$@"
