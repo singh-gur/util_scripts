@@ -14,11 +14,9 @@ SOURCE_TOKEN_FILE="${SOURCE_REGISTRY_TOKEN_FILE:-}"
 TARGET_USER="${TARGET_REGISTRY_USER:-}"
 TARGET_TOKEN="${TARGET_REGISTRY_TOKEN:-}"
 TARGET_TOKEN_FILE="${TARGET_REGISTRY_TOKEN_FILE:-}"
-VPN=false
-VPN_COUNTRY=""
-VPN_TIMEOUT=60
 PLATFORM=""
 DRY_RUN=false
+FORCE_COPY=false
 CLEANUP=false
 VERBOSE=false
 TEMP_DIR=""
@@ -56,8 +54,7 @@ usage: $SCRIPT_NAME SOURCE_IMAGE TARGET_IMAGE [options]
 
 Copy a container image from one registry to another using skopeo. This is
 Kubernetes-friendly because it does not require a Docker daemon or privileged
-pod. Optionally logs in to source and target registries and can connect NordVPN
-before syncing.
+pod. Optionally logs in to source and target registries before syncing.
 
 Arguments:
   SOURCE_IMAGE              Image to copy, e.g. docker.io/library/nginx:1.27
@@ -75,13 +72,9 @@ Environment authentication defaults:
   SOURCE_REGISTRY_USER, SOURCE_REGISTRY_TOKEN, SOURCE_REGISTRY_TOKEN_FILE
   TARGET_REGISTRY_USER, TARGET_REGISTRY_TOKEN, TARGET_REGISTRY_TOKEN_FILE
 
-VPN:
-  --vpn                     Use NordVPN; connect if not already connected
-  --vpn-country COUNTRY     NordVPN country/server group to connect to
-  --vpn-timeout SECONDS     Seconds to wait for VPN connection (default: $VPN_TIMEOUT)
-
 Options:
   --platform PLATFORM       Platform to copy, e.g. linux/amd64 or linux/arm64/v8
+  --force-copy              Copy even when target already has the same digest
   --cleanup                 Accepted for compatibility; no-op with skopeo
   --dry-run                 Show commands without making changes
   -v, --verbose             Enable verbose output
@@ -186,28 +179,6 @@ parse_args() {
                 TARGET_TOKEN_FILE="${1#*=}"
                 shift
                 ;;
-            --vpn)
-                VPN=true
-                shift
-                ;;
-            --vpn-country)
-                require_value "$1" "$#"
-                VPN_COUNTRY="$2"
-                shift 2
-                ;;
-            --vpn-country=*)
-                VPN_COUNTRY="${1#*=}"
-                shift
-                ;;
-            --vpn-timeout)
-                require_value "$1" "$#"
-                VPN_TIMEOUT="$2"
-                shift 2
-                ;;
-            --vpn-timeout=*)
-                VPN_TIMEOUT="${1#*=}"
-                shift
-                ;;
             --platform)
                 require_value "$1" "$#"
                 PLATFORM="$2"
@@ -215,6 +186,10 @@ parse_args() {
                 ;;
             --platform=*)
                 PLATFORM="${1#*=}"
+                shift
+                ;;
+            --force-copy)
+                FORCE_COPY=true
                 shift
                 ;;
             --cleanup)
@@ -286,11 +261,6 @@ validate_args() {
         exit 1
     fi
 
-    if ! [[ "$VPN_TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$VPN_TIMEOUT" -eq 0 ]]; then
-        log_error "--vpn-timeout must be a positive integer"
-        exit 1
-    fi
-
     if [[ -n "$PLATFORM" ]]; then
         IFS=/ read -r os arch variant extra <<< "$PLATFORM"
         if [[ -z "$os" || -z "$arch" || -n "$extra" ]]; then
@@ -305,10 +275,6 @@ validate_dependencies() {
 
     if [[ "$DRY_RUN" != true ]] && ! command -v skopeo >/dev/null 2>&1; then
         missing_deps+=("skopeo")
-    fi
-
-    if [[ "$VPN" == true && "$DRY_RUN" != true ]] && ! command -v nordvpn >/dev/null 2>&1; then
-        missing_deps+=("nordvpn")
     fi
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
@@ -407,83 +373,6 @@ skopeo_login_if_requested() {
     fi
 }
 
-vpn_is_connected() {
-    local status_output=""
-
-    if ! status_output=$(nordvpn status 2>&1); then
-        log_error "Unable to check NordVPN status"
-        echo "$status_output" >&2
-        return 2
-    fi
-
-    log_verbose "$status_output"
-
-    if grep -qi "Status:[[:space:]]*Connected" <<< "$status_output"; then
-        return 0
-    fi
-
-    return 1
-}
-
-ensure_vpn_connected() {
-    local status_code=0
-    local elapsed=0
-    local connect_cmd=(nordvpn connect)
-
-    if [[ "$VPN" != true ]]; then
-        return
-    fi
-
-    if [[ "$DRY_RUN" == true ]]; then
-        echo "[DRY-RUN] nordvpn status"
-        if [[ -n "$VPN_COUNTRY" ]]; then
-            echo "[DRY-RUN] nordvpn connect $VPN_COUNTRY"
-        else
-            echo "[DRY-RUN] nordvpn connect"
-        fi
-        return
-    fi
-
-    if vpn_is_connected; then
-        log_info "NordVPN is already connected"
-        return
-    else
-        status_code=$?
-    fi
-
-    if [[ "$status_code" -ne 1 ]]; then
-        exit 1
-    fi
-
-    if [[ -n "$VPN_COUNTRY" ]]; then
-        connect_cmd+=("$VPN_COUNTRY")
-    fi
-
-    log_info "NordVPN is not connected; connecting now"
-    run_cmd "${connect_cmd[@]}"
-
-    while true; do
-        if vpn_is_connected; then
-            log_info "NordVPN connected"
-            return
-        else
-            status_code=$?
-        fi
-
-        if [[ "$status_code" -ne 1 ]]; then
-            exit 1
-        fi
-
-        if [[ "$elapsed" -ge "$VPN_TIMEOUT" ]]; then
-            log_error "Timed out waiting for NordVPN to connect"
-            exit 1
-        fi
-
-        sleep 2
-        elapsed=$((elapsed + 2))
-    done
-}
-
 add_platform_args() {
     local -n cmd_ref=$1
     local os=""
@@ -500,6 +389,75 @@ add_platform_args() {
     if [[ -n "$variant" ]]; then
         cmd_ref+=(--override-variant "$variant")
     fi
+}
+
+inspect_image_digest() {
+    local image="$1"
+    local inspect_cmd=(skopeo inspect --format '{{.Digest}}')
+
+    if [[ -n "$AUTH_FILE" ]]; then
+        inspect_cmd+=(--authfile "$AUTH_FILE")
+    fi
+
+    add_platform_args inspect_cmd
+    inspect_cmd+=("docker://$image")
+
+    "${inspect_cmd[@]}"
+}
+
+show_digest_check_dry_run() {
+    local source_cmd=(skopeo inspect --format '{{.Digest}}')
+    local target_cmd=(skopeo inspect --format '{{.Digest}}')
+
+    if [[ -n "$AUTH_FILE" ]]; then
+        source_cmd+=(--authfile "<temp-authfile>")
+        target_cmd+=(--authfile "<temp-authfile>")
+    fi
+
+    add_platform_args source_cmd
+    add_platform_args target_cmd
+    source_cmd+=("docker://$SOURCE_IMAGE")
+    target_cmd+=("docker://$TARGET_IMAGE")
+
+    echo "[DRY-RUN] $(format_command "${source_cmd[@]}")"
+    echo "[DRY-RUN] $(format_command "${target_cmd[@]}")"
+}
+
+image_already_synced() {
+    local source_digest=""
+    local target_digest=""
+
+    if [[ "$FORCE_COPY" == true ]]; then
+        log_info "Skipping digest check because --force-copy was requested"
+        return 1
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        show_digest_check_dry_run
+        return 1
+    fi
+
+    log_info "Checking whether target already has the source digest"
+
+    if ! source_digest=$(inspect_image_digest "$SOURCE_IMAGE"); then
+        log_error "Unable to inspect source image: $SOURCE_IMAGE"
+        exit 1
+    fi
+
+    if ! target_digest=$(inspect_image_digest "$TARGET_IMAGE"); then
+        log_verbose "Target image is not inspectable or does not exist"
+        return 1
+    fi
+
+    log_verbose "Source digest: $source_digest"
+    log_verbose "Target digest: $target_digest"
+
+    if [[ -n "$source_digest" && "$source_digest" == "$target_digest" ]]; then
+        log_info "Target already has matching digest; skipping copy"
+        return 0
+    fi
+
+    return 1
 }
 
 sync_image() {
@@ -531,10 +489,13 @@ main() {
     source_registry=$(image_registry "$SOURCE_IMAGE")
     target_registry=$(image_registry "$TARGET_IMAGE")
 
-    ensure_vpn_connected
-
     skopeo_login_if_requested "source" "$source_registry" "$SOURCE_USER" "$SOURCE_TOKEN" "$SOURCE_TOKEN_FILE"
     skopeo_login_if_requested "target" "$target_registry" "$TARGET_USER" "$TARGET_TOKEN" "$TARGET_TOKEN_FILE"
+
+    if image_already_synced; then
+        log_info "Image sync complete"
+        return
+    fi
 
     sync_image
 
