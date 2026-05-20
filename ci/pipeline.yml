@@ -13,7 +13,7 @@ resources:
     type: registry-image
     icon: docker
     source:
-      repository: regv2.gsingh.io/gurbakhshish/util_scripts
+      repository: regv2.gsingh.io/personal/util_scripts
       username: ((registry_username))
       password: ((registry_password))
 
@@ -21,7 +21,7 @@ resources:
     type: registry-image
     icon: docker
     source:
-      repository: git.gsingh.io/common/util_scripts
+      repository: git.gsingh.io/gurbakhshish/util_scripts
       username: ((git_publish_registry_username))
       password: ((git_publish_registry_password))
 
