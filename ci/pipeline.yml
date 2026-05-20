@@ -17,6 +17,14 @@ resources:
       username: ((registry_username))
       password: ((registry_password))
 
+  - name: git-docker-image
+    type: registry-image
+    icon: docker
+    source:
+      repository: git.gsingh.io/common/util_scripts
+      username: ((git_publish_registry_username))
+      password: ((git_publish_registry_password))
+
 jobs:
   - name: validate
     public: true
@@ -112,6 +120,11 @@ jobs:
             path: build
 
       - put: docker-image
+        params:
+          image: image/image.tar
+          additional_tags: tags/all
+
+      - put: git-docker-image
         params:
           image: image/image.tar
           additional_tags: tags/all
