@@ -30,6 +30,9 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 RUN pipx install faraday-cli
 
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+    | sh -s -- -b /usr/local/bin
+
 WORKDIR /workspace
 
 COPY . /src
