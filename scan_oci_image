@@ -1,0 +1,773 @@
+#!/bin/bash
+
+set -e
+set -u
+set -o pipefail
+
+SCRIPT_NAME=$(basename "$0")
+
+IMAGE=""
+FORMAT="table"
+OUTPUT_FILE=""
+SCANNERS=""
+SEVERITY=""
+PLATFORM=""
+IGNORE_UNFIXED=false
+SKIP_DB_UPDATE=false
+EXIT_CODE=""
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+TIMEOUT=""
+INSECURE=false
+
+REGISTRY_USER="${REGISTRY_USER:-}"
+REGISTRY_TOKEN="${REGISTRY_TOKEN:-}"
+REGISTRY_TOKEN_FILE="${REGISTRY_TOKEN_FILE:-}"
+
+UPLOAD_TO_FARADAY=false
+FARADAY_URL="${FARADAY_URL:-}"
+FARADAY_TOKEN="${FARADAY_TOKEN:-}"
+FARADAY_USER="${FARADAY_USER:-}"
+FARADAY_PASSWORD="${FARADAY_PASSWORD:-}"
+FARADAY_PASSWORD_FILE="${FARADAY_PASSWORD_FILE:-}"
+FARADAY_WORKSPACE="${FARADAY_WORKSPACE:-}"
+FARADAY_IGNORE_SSL=false
+FARADAY_CREATE_WORKSPACE=false
+FARADAY_PLUGIN_ID="Trivy_Json"
+FARADAY_VULN_TAG=""
+FARADAY_HOST_TAG=""
+FARADAY_MIN_SEVERITY=""
+FARADAY_MAX_SEVERITY=""
+
+CLEANUP_FILES=()
+
+cleanup() {
+    local exit_code=$?
+
+    for file in "${CLEANUP_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            rm -f "$file"
+        fi
+    done
+
+    exit $exit_code
+}
+
+trap cleanup EXIT
+
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_error() {
+    echo "[ERROR] $1" >&2
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo "[VERBOSE] $1"
+    fi
+}
+
+usage() {
+    cat << EOF
+usage: $SCRIPT_NAME IMAGE [options]
+
+Scan a container image for vulnerabilities with Trivy. Optionally upload JSON
+results to a self-hosted Faraday server using faraday-cli and the Trivy_Json
+report plugin.
+
+References:
+  Trivy image scan: https://trivy.dev/docs/latest/target/container_image/
+  Trivy reporting:  https://trivy.dev/docs/latest/configuration/reporting/
+  Faraday import:   https://docs.faradaysec.com/import/
+  Faraday CLI:      https://docs.faraday-cli.faradaysec.com/commands/
+
+Arguments:
+  IMAGE                 OCI image reference, e.g. alpine:3.20 or registry.example.com/app:1.0
+
+Scan options:
+  -f, --format FORMAT   Report format: table, json, sarif, cyclonedx, spdx,
+                        spdx-json, github, cosign-vuln (default: table)
+  -o, --output FILE     Write the scan report to FILE
+  --scanners LIST       Comma-separated scanners: vuln,misconfig,secret,license
+  --severity LIST       Comma-separated severities: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+  --platform PLATFORM   Platform to scan, e.g. linux/amd64
+  --ignore-unfixed      Report only vulnerabilities with fixes available
+  --skip-db-update      Skip updating the Trivy vulnerability database
+  --exit-code CODE      Exit with CODE when vulnerabilities are found (CI gate)
+  --timeout DURATION    Scan timeout, e.g. 10m (Trivy default: 5m)
+  --insecure            Allow insecure registry connections
+  -q, --quiet           Suppress Trivy progress output
+  --dry-run             Show commands without running them
+  -v, --verbose         Enable verbose logging
+
+Registry authentication:
+  --registry-user USER          Registry username
+  --registry-token TOKEN        Registry password or token
+  --registry-token-file FILE    Read registry token from file
+
+Environment registry defaults:
+  REGISTRY_USER, REGISTRY_TOKEN, REGISTRY_TOKEN_FILE
+
+Faraday upload (optional):
+  --upload-to-faraday           Upload the Trivy JSON report to Faraday
+  --faraday-url URL             Faraday server URL (env: FARADAY_URL)
+  --faraday-token TOKEN         Faraday API token (env: FARADAY_TOKEN)
+  --faraday-user USER           Faraday username for login (env: FARADAY_USER)
+  --faraday-password PASS       Faraday password (env: FARADAY_PASSWORD)
+  --faraday-password-file FILE  Read Faraday password from file
+  --faraday-workspace NAME      Target workspace (env: FARADAY_WORKSPACE)
+  --faraday-create-workspace    Create workspace if it does not exist
+  --faraday-ignore-ssl          Ignore TLS certificate errors for Faraday
+  --faraday-vuln-tag TAG        Tag to add to imported vulnerabilities
+  --faraday-host-tag TAG        Tag to add to imported hosts
+  --faraday-min-severity LEVEL  Minimum severity to import
+  --faraday-max-severity LEVEL  Maximum severity to import
+
+Notes:
+  Faraday upload requires faraday-cli and always uses Trivy JSON internally.
+  When uploading with the default table format, the script scans to JSON,
+  uploads to Faraday, then renders the table with "trivy convert".
+
+Examples:
+  $SCRIPT_NAME alpine:3.20
+
+  $SCRIPT_NAME registry.example.com/me/app:latest \\
+    --registry-user ci --registry-token-file /run/secrets/registry-token \\
+    --severity HIGH,CRITICAL --exit-code 1
+
+  $SCRIPT_NAME nginx:1.27 --format json --output trivy-report.json \\
+    --upload-to-faraday \\
+    --faraday-url https://faraday.example.com \\
+    --faraday-token "\$FARADAY_TOKEN" \\
+    --faraday-workspace container-scans \\
+    --faraday-vuln-tag nginx:1.27
+
+  $SCRIPT_NAME myapp:latest --upload-to-faraday \\
+    --faraday-url https://faraday.example.com \\
+    --faraday-user scanner --faraday-password-file /run/secrets/faraday-pass \\
+    --faraday-workspace container-scans --faraday-create-workspace
+
+EOF
+}
+
+format_command() {
+    local cmd=""
+    local arg=""
+    local escaped=""
+
+    for arg in "$@"; do
+        printf -v escaped "%q" "$arg"
+        cmd+="$escaped "
+    done
+
+    echo "${cmd% }"
+}
+
+run_cmd() {
+    if [[ "$DRY_RUN" == true ]]; then
+        echo "[DRY-RUN] $(format_command "$@")"
+    else
+        log_verbose "Running: $(format_command "$@")"
+        "$@"
+    fi
+}
+
+require_value() {
+    local option="$1"
+    local remaining="$2"
+
+    if [[ "$remaining" -lt 2 ]]; then
+        log_error "Missing value for $option"
+        exit 1
+    fi
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--format)
+                require_value "$1" "$#"
+                FORMAT="$2"
+                shift 2
+                ;;
+            -f=*|--format=*)
+                FORMAT="${1#*=}"
+                shift
+                ;;
+            -o|--output)
+                require_value "$1" "$#"
+                OUTPUT_FILE="$2"
+                shift 2
+                ;;
+            -o=*|--output=*)
+                OUTPUT_FILE="${1#*=}"
+                shift
+                ;;
+            --scanners)
+                require_value "$1" "$#"
+                SCANNERS="$2"
+                shift 2
+                ;;
+            --scanners=*)
+                SCANNERS="${1#*=}"
+                shift
+                ;;
+            --severity)
+                require_value "$1" "$#"
+                SEVERITY="$2"
+                shift 2
+                ;;
+            --severity=*)
+                SEVERITY="${1#*=}"
+                shift
+                ;;
+            --platform)
+                require_value "$1" "$#"
+                PLATFORM="$2"
+                shift 2
+                ;;
+            --platform=*)
+                PLATFORM="${1#*=}"
+                shift
+                ;;
+            --ignore-unfixed)
+                IGNORE_UNFIXED=true
+                shift
+                ;;
+            --skip-db-update)
+                SKIP_DB_UPDATE=true
+                shift
+                ;;
+            --exit-code)
+                require_value "$1" "$#"
+                EXIT_CODE="$2"
+                shift 2
+                ;;
+            --exit-code=*)
+                EXIT_CODE="${1#*=}"
+                shift
+                ;;
+            --timeout)
+                require_value "$1" "$#"
+                TIMEOUT="$2"
+                shift 2
+                ;;
+            --timeout=*)
+                TIMEOUT="${1#*=}"
+                shift
+                ;;
+            --insecure)
+                INSECURE=true
+                shift
+                ;;
+            --registry-user)
+                require_value "$1" "$#"
+                REGISTRY_USER="$2"
+                shift 2
+                ;;
+            --registry-user=*)
+                REGISTRY_USER="${1#*=}"
+                shift
+                ;;
+            --registry-token)
+                require_value "$1" "$#"
+                REGISTRY_TOKEN="$2"
+                shift 2
+                ;;
+            --registry-token=*)
+                REGISTRY_TOKEN="${1#*=}"
+                shift
+                ;;
+            --registry-token-file)
+                require_value "$1" "$#"
+                REGISTRY_TOKEN_FILE="$2"
+                shift 2
+                ;;
+            --registry-token-file=*)
+                REGISTRY_TOKEN_FILE="${1#*=}"
+                shift
+                ;;
+            --upload-to-faraday)
+                UPLOAD_TO_FARADAY=true
+                shift
+                ;;
+            --faraday-url)
+                require_value "$1" "$#"
+                FARADAY_URL="$2"
+                shift 2
+                ;;
+            --faraday-url=*)
+                FARADAY_URL="${1#*=}"
+                shift
+                ;;
+            --faraday-token)
+                require_value "$1" "$#"
+                FARADAY_TOKEN="$2"
+                shift 2
+                ;;
+            --faraday-token=*)
+                FARADAY_TOKEN="${1#*=}"
+                shift
+                ;;
+            --faraday-user)
+                require_value "$1" "$#"
+                FARADAY_USER="$2"
+                shift 2
+                ;;
+            --faraday-user=*)
+                FARADAY_USER="${1#*=}"
+                shift
+                ;;
+            --faraday-password)
+                require_value "$1" "$#"
+                FARADAY_PASSWORD="$2"
+                shift 2
+                ;;
+            --faraday-password=*)
+                FARADAY_PASSWORD="${1#*=}"
+                shift
+                ;;
+            --faraday-password-file)
+                require_value "$1" "$#"
+                FARADAY_PASSWORD_FILE="$2"
+                shift 2
+                ;;
+            --faraday-password-file=*)
+                FARADAY_PASSWORD_FILE="${1#*=}"
+                shift
+                ;;
+            --faraday-workspace)
+                require_value "$1" "$#"
+                FARADAY_WORKSPACE="$2"
+                shift 2
+                ;;
+            --faraday-workspace=*)
+                FARADAY_WORKSPACE="${1#*=}"
+                shift
+                ;;
+            --faraday-create-workspace)
+                FARADAY_CREATE_WORKSPACE=true
+                shift
+                ;;
+            --faraday-ignore-ssl)
+                FARADAY_IGNORE_SSL=true
+                shift
+                ;;
+            --faraday-vuln-tag)
+                require_value "$1" "$#"
+                FARADAY_VULN_TAG="$2"
+                shift 2
+                ;;
+            --faraday-vuln-tag=*)
+                FARADAY_VULN_TAG="${1#*=}"
+                shift
+                ;;
+            --faraday-host-tag)
+                require_value "$1" "$#"
+                FARADAY_HOST_TAG="$2"
+                shift 2
+                ;;
+            --faraday-host-tag=*)
+                FARADAY_HOST_TAG="${1#*=}"
+                shift
+                ;;
+            --faraday-min-severity)
+                require_value "$1" "$#"
+                FARADAY_MIN_SEVERITY="$2"
+                shift 2
+                ;;
+            --faraday-min-severity=*)
+                FARADAY_MIN_SEVERITY="${1#*=}"
+                shift
+                ;;
+            --faraday-max-severity)
+                require_value "$1" "$#"
+                FARADAY_MAX_SEVERITY="$2"
+                shift 2
+                ;;
+            --faraday-max-severity=*)
+                FARADAY_MAX_SEVERITY="${1#*=}"
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [[ -z "$IMAGE" ]]; then
+                    IMAGE="$1"
+                else
+                    log_error "Unexpected argument: $1"
+                    usage
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+}
+
+validate_format() {
+    case "$FORMAT" in
+        table|json|sarif|cyclonedx|spdx|spdx-json|github|cosign-vuln)
+            ;;
+        *)
+            log_error "Unsupported format: $FORMAT"
+            exit 1
+            ;;
+    esac
+}
+
+validate_args() {
+    if [[ -z "$IMAGE" ]]; then
+        log_error "IMAGE is required"
+        usage
+        exit 1
+    fi
+
+    validate_format
+
+    if [[ -n "$REGISTRY_TOKEN" && -z "$REGISTRY_USER" ]]; then
+        log_error "--registry-token requires --registry-user"
+        exit 1
+    fi
+
+    if [[ -n "$REGISTRY_TOKEN_FILE" && -z "$REGISTRY_USER" ]]; then
+        log_error "--registry-token-file requires --registry-user"
+        exit 1
+    fi
+
+    if [[ "$UPLOAD_TO_FARADAY" == true ]]; then
+        if [[ -z "$FARADAY_URL" ]]; then
+            log_error "--upload-to-faraday requires --faraday-url or FARADAY_URL"
+            exit 1
+        fi
+
+        if [[ -z "$FARADAY_WORKSPACE" ]]; then
+            log_error "--upload-to-faraday requires --faraday-workspace or FARADAY_WORKSPACE"
+            exit 1
+        fi
+
+        if [[ -z "$FARADAY_TOKEN" && -z "$FARADAY_USER" ]]; then
+            log_error "Faraday authentication required: set --faraday-token/FARADAY_TOKEN or --faraday-user with password"
+            exit 1
+        fi
+
+        if [[ -n "$FARADAY_USER" && -z "$FARADAY_TOKEN" && -z "$FARADAY_PASSWORD" && -z "$FARADAY_PASSWORD_FILE" ]]; then
+            log_error "--faraday-user requires --faraday-password, --faraday-password-file, or FARADAY_PASSWORD"
+            exit 1
+        fi
+    fi
+
+    if [[ -n "$EXIT_CODE" && ! "$EXIT_CODE" =~ ^[0-9]+$ ]]; then
+        log_error "--exit-code must be a non-negative integer"
+        exit 1
+    fi
+}
+
+validate_dependencies() {
+    local missing_deps=()
+
+    if [[ "$DRY_RUN" != true ]]; then
+        if ! command -v trivy >/dev/null 2>&1; then
+            missing_deps+=("trivy")
+        fi
+
+        if [[ "$UPLOAD_TO_FARADAY" == true ]] && ! command -v faraday-cli >/dev/null 2>&1; then
+            missing_deps+=("faraday-cli")
+        fi
+    fi
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing_deps[*]}"
+        exit 1
+    fi
+}
+
+resolve_secret() {
+    local label="$1"
+    local value="$2"
+    local value_file="$3"
+
+    if [[ -z "$value" && -n "$value_file" ]]; then
+        if [[ ! -f "$value_file" ]]; then
+            log_error "$label file does not exist: $value_file"
+            return 1
+        fi
+
+        value=$(<"$value_file")
+    fi
+
+    if [[ -n "$value" ]]; then
+        printf '%s' "$value"
+        return 0
+    fi
+
+    if [[ -t 0 ]]; then
+        printf "Enter %s: " "$label" >&2
+        read -r -s value
+        printf '\n' >&2
+        printf '%s' "$value"
+        return 0
+    fi
+
+    log_error "No $label provided and stdin is not interactive"
+    return 1
+}
+
+configure_registry_auth() {
+    local token=""
+
+    if [[ -z "$REGISTRY_USER" ]]; then
+        return
+    fi
+
+    if ! token=$(resolve_secret "registry token" "$REGISTRY_TOKEN" "$REGISTRY_TOKEN_FILE"); then
+        exit 1
+    fi
+
+    if [[ -z "$token" ]]; then
+        log_error "No registry token provided for user: $REGISTRY_USER"
+        exit 1
+    fi
+
+    export TRIVY_USERNAME="$REGISTRY_USER"
+    export TRIVY_PASSWORD="$token"
+    log_verbose "Configured registry authentication for user: $REGISTRY_USER"
+}
+
+build_trivy_scan_cmd() {
+    local -n cmd_ref=$1
+    local format="$2"
+    local output_file="${3:-}"
+
+    cmd_ref=(trivy image --format "$format")
+
+    if [[ -n "$output_file" ]]; then
+        cmd_ref+=(-o "$output_file")
+    fi
+
+    if [[ -n "$SCANNERS" ]]; then
+        cmd_ref+=(--scanners "$SCANNERS")
+    fi
+
+    if [[ -n "$SEVERITY" ]]; then
+        cmd_ref+=(--severity "$SEVERITY")
+    fi
+
+    if [[ -n "$PLATFORM" ]]; then
+        cmd_ref+=(--platform "$PLATFORM")
+    fi
+
+    if [[ "$IGNORE_UNFIXED" == true ]]; then
+        cmd_ref+=(--ignore-unfixed)
+    fi
+
+    if [[ "$SKIP_DB_UPDATE" == true ]]; then
+        cmd_ref+=(--skip-db-update)
+    fi
+
+    if [[ -n "$EXIT_CODE" ]]; then
+        cmd_ref+=(--exit-code "$EXIT_CODE")
+    fi
+
+    if [[ -n "$TIMEOUT" ]]; then
+        cmd_ref+=(--timeout "$TIMEOUT")
+    fi
+
+    if [[ "$INSECURE" == true ]]; then
+        cmd_ref+=(--insecure)
+    fi
+
+    if [[ "$QUIET" == true ]]; then
+        cmd_ref+=(--quiet)
+    fi
+
+    cmd_ref+=("$IMAGE")
+}
+
+build_trivy_convert_cmd() {
+    local -n cmd_ref=$1
+    local json_report="$2"
+    local format="$3"
+    local output_file="${4:-}"
+
+    cmd_ref=(trivy convert --format "$format")
+
+    if [[ -n "$output_file" ]]; then
+        cmd_ref+=(-o "$output_file")
+    fi
+
+    if [[ -n "$SCANNERS" ]]; then
+        cmd_ref+=(--scanners "$SCANNERS")
+    fi
+
+    if [[ -n "$SEVERITY" ]]; then
+        cmd_ref+=(--severity "$SEVERITY")
+    fi
+
+    if [[ -n "$EXIT_CODE" ]]; then
+        cmd_ref+=(--exit-code "$EXIT_CODE")
+    fi
+
+    cmd_ref+=("$json_report")
+}
+
+create_temp_report() {
+    local temp_file=""
+
+    temp_file=$(mktemp "/tmp/${SCRIPT_NAME}.XXXXXX.json")
+    CLEANUP_FILES+=("$temp_file")
+    printf '%s' "$temp_file"
+}
+
+render_report() {
+    local json_report="$1"
+    local convert_cmd=()
+
+    if [[ "$FORMAT" == "json" ]]; then
+        if [[ -n "$OUTPUT_FILE" ]]; then
+            if [[ "$DRY_RUN" == true ]]; then
+                echo "[DRY-RUN] cp $json_report $OUTPUT_FILE"
+            else
+                cp "$json_report" "$OUTPUT_FILE"
+                log_info "Wrote JSON report: $OUTPUT_FILE"
+            fi
+        elif [[ "$DRY_RUN" != true ]]; then
+            cat "$json_report"
+        fi
+        return
+    fi
+
+    build_trivy_convert_cmd convert_cmd "$json_report" "$FORMAT" "$OUTPUT_FILE"
+    run_cmd "${convert_cmd[@]}"
+
+    if [[ -n "$OUTPUT_FILE" ]]; then
+        log_info "Wrote $FORMAT report: $OUTPUT_FILE"
+    fi
+}
+
+run_scan() {
+    local scan_cmd=()
+    local json_report=""
+
+    if [[ "$UPLOAD_TO_FARADAY" == true ]]; then
+        if [[ "$FORMAT" == "json" && -n "$OUTPUT_FILE" ]]; then
+            json_report="$OUTPUT_FILE"
+        else
+            json_report=$(create_temp_report)
+        fi
+
+        build_trivy_scan_cmd scan_cmd "json" "$json_report"
+        log_info "Scanning image: $IMAGE"
+        run_cmd "${scan_cmd[@]}"
+
+        if [[ "$FORMAT" != "json" || -z "$OUTPUT_FILE" ]]; then
+            render_report "$json_report"
+        elif [[ "$DRY_RUN" != true ]]; then
+            log_info "Wrote JSON report: $OUTPUT_FILE"
+        fi
+
+        upload_to_faraday "$json_report"
+        return
+    fi
+
+    build_trivy_scan_cmd scan_cmd "$FORMAT" "$OUTPUT_FILE"
+    log_info "Scanning image: $IMAGE"
+    run_cmd "${scan_cmd[@]}"
+
+    if [[ -n "$OUTPUT_FILE" ]]; then
+        log_info "Wrote $FORMAT report: $OUTPUT_FILE"
+    fi
+}
+
+configure_faraday_auth() {
+    local password=""
+
+    export FARADAY_URL
+
+    if [[ -n "$FARADAY_TOKEN" ]]; then
+        export FARADAY_TOKEN
+        log_verbose "Using Faraday API token authentication"
+        return
+    fi
+
+    if ! password=$(resolve_secret "Faraday password" "$FARADAY_PASSWORD" "$FARADAY_PASSWORD_FILE"); then
+        exit 1
+    fi
+
+    if [[ -z "$password" ]]; then
+        log_error "No Faraday password provided for user: $FARADAY_USER"
+        exit 1
+    fi
+
+    local auth_cmd=(faraday-cli auth --faraday-url "$FARADAY_URL" --user "$FARADAY_USER" --password "$password")
+    if [[ "$FARADAY_IGNORE_SSL" == true ]]; then
+        auth_cmd+=(--ignore-ssl)
+    fi
+
+    log_info "Authenticating to Faraday: $FARADAY_URL"
+    run_cmd "${auth_cmd[@]}"
+}
+
+upload_to_faraday() {
+    local report_file="$1"
+    local upload_cmd=(faraday-cli tool report "$report_file" --plugin-id "$FARADAY_PLUGIN_ID" -w "$FARADAY_WORKSPACE")
+
+    if [[ "$FARADAY_CREATE_WORKSPACE" == true ]]; then
+        upload_cmd+=(--create-workspace)
+    fi
+
+    if [[ -n "$FARADAY_VULN_TAG" ]]; then
+        upload_cmd+=(--vuln-tag "$FARADAY_VULN_TAG")
+    fi
+
+    if [[ -n "$FARADAY_HOST_TAG" ]]; then
+        upload_cmd+=(--host-tag "$FARADAY_HOST_TAG")
+    fi
+
+    if [[ -n "$FARADAY_MIN_SEVERITY" ]]; then
+        upload_cmd+=(--min-severity "$FARADAY_MIN_SEVERITY")
+    fi
+
+    if [[ -n "$FARADAY_MAX_SEVERITY" ]]; then
+        upload_cmd+=(--max-severity "$FARADAY_MAX_SEVERITY")
+    fi
+
+    configure_faraday_auth
+
+    log_info "Uploading Trivy report to Faraday workspace: $FARADAY_WORKSPACE"
+    run_cmd "${upload_cmd[@]}"
+    log_info "Faraday upload complete"
+}
+
+main() {
+    parse_args "$@"
+    validate_args
+    validate_dependencies
+    configure_registry_auth
+    run_scan
+    log_info "Scan complete"
+}
+
+main "$@"

@@ -14,8 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     less \
     nfs-common \
     openssh-client \
+    pipx \
     postgresql-client \
     procps \
+    python3 \
     skopeo \
     tmux \
     unzip \
@@ -23,6 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     zip \
     && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN pipx install faraday-cli
 
 WORKDIR /workspace
 
