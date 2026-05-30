@@ -1,59 +1,210 @@
 #!/bin/bash
-
-#display and exit-on-error for all commands
-set -e
-set +v
-
-echo "Installing zig"
+set -euo pipefail
 
 ZIG_VERSION=""
 FORCE=""
+INSTALL_DIR="/usr/local/zig"
+CLEANUP_FILES=()
 
-usage()
-{
+usage() {
+    cat << EOF
+usage: install_zig [options]
 
-cat << eof
-usage: install_zig <options>
--v, --version      zig version to install (Optional: if not provided latest version is installed)
--h, --help         get usage info
-eof
+Install Zig programming language compiler.
+
+Options:
+  -v, --version VERSION    Zig version to install (default: latest)
+  -f, --force              Force reinstall even if already installed
+  -h, --help               Show this help message
+
+Examples:
+  $0                       Install latest version
+  $0 --version 0.11.0      Install specific version
+  $0 -v 0.11.0 --force     Force reinstall specific version
+EOF
 }
 
-while [ "$1" != "" ]; do
-    PARAM=`echo $1 | awk -F= '{print $1}'`
-    VALUE=`echo $1 | awk -F= '{print $2}'`
-    case $PARAM in
-        -v | --version )
-            ZIG_VERSION=$(echo $VALUE | tr -d '"')
-        ;;
-        -f | --force )
-            FORCE="Y"
-        ;;
-        -h | --help )
-            usage
+cleanup() {
+    local exit_code=$?
+    if [[ ${#CLEANUP_FILES[@]} -gt 0 ]]; then
+        for item in "${CLEANUP_FILES[@]}"; do
+            if [[ -d "$item" ]]; then
+                rm -rf "$item"
+            elif [[ -f "$item" ]]; then
+                rm -f "$item"
+            fi
+        done
+    fi
+    exit $exit_code
+}
+
+trap cleanup EXIT
+
+validate_dependencies() {
+    local missing_deps=()
+
+    for cmd in curl wget jq tar sudo minisign; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing_deps[*]}" >&2
+        exit 1
+    fi
+}
+
+get_minisign_pubkey() {
+    local url="https://ziglang.org/download/"
+    local page
+    local pubkey
+
+    page="$(curl -fsSL "$url")" || {
+        echo "Error: Failed to fetch minisign public key page: $url" >&2
+        exit 1
+    }
+
+    pubkey="$(awk '
+        match($0, /RW[A-Za-z0-9+\/=]+/) {
+            print substr($0, RSTART, RLENGTH)
             exit
+        }
+    ' <<< "$page")"
+
+    if [[ -z "$pubkey" ]]; then
+        echo "Error: Failed to find minisign public key on $url" >&2
+        exit 1
+    fi
+
+    echo "$pubkey"
+}
+
+verify_signature() {
+    local file="$1"
+    local signature="$2"
+    local public_key="$3"
+
+    echo "Verifying signature..."
+    if ! minisign -Vm "$file" -x "$signature" -P "$public_key"; then
+        echo "Error: Signature verification failed for $file" >&2
+        echo "The download may be corrupted or tampered with." >&2
+        exit 1
+    fi
+    echo "Signature verified successfully"
+}
+
+get_latest_version() {
+    local version
+    version="$(curl -fsSL https://api.github.com/repos/ziglang/zig/releases/latest | jq -r '.tag_name')" || {
+        echo "Error: Failed to fetch latest Zig version" >&2
+        exit 1
+    }
+    if [[ -z "$version" || "$version" == "null" ]]; then
+        echo "Error: Failed to parse latest Zig version" >&2
+        exit 1
+    fi
+    echo "$version"
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -v|--version)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --version requires a value" >&2
+                exit 1
+            fi
+            ZIG_VERSION="$2"
+            shift 2
+            ;;
+        -v=*|--version=*)
+            ZIG_VERSION="${1#*=}"
+            if [[ -z "$ZIG_VERSION" ]]; then
+                echo "Error: --version requires a value" >&2
+                exit 1
+            fi
+            shift
+            ;;
+        -f|--force)
+            FORCE="Y"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
     esac
-    shift
 done
 
+validate_dependencies
+
 if [[ -z "$ZIG_VERSION" ]]; then
-    ZIG_VERSION="$(curl -s https://api.github.com/repos/ziglang/zig/releases/latest | jq .tag_name -r)"
+    echo "Fetching latest version..."
+    ZIG_VERSION="$(get_latest_version)"
 fi
 
 if [[ -z "$FORCE" ]]; then
-    if command -v zig &> /dev/null
-    then
+    if command -v zig &> /dev/null; then
         CURR_VERSION="$(zig version)"
-        [[ "$CURR_VERSION" == "$ZIG_VERSION" ]] && { echo "$ZIG_VERSION already installed !!"; exit 0; }
-        echo "Current Version: $CURR_VERSION"
+        if [[ "$CURR_VERSION" == "$ZIG_VERSION" ]]; then
+            echo "Zig $ZIG_VERSION is already installed"
+            exit 0
+        fi
+        echo "Current version: $CURR_VERSION"
     fi
 fi
 
-cd /tmp
-echo "Downloading zig version $ZIG_VERSION"
-wget https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz
-cd -
-[ -d /usr/local/zig ] && sudo rm -rf /usr/local/zig
-sudo mkdir -p /usr/local/zig
-sudo tar --strip=1 -C /usr/local/zig -xf /tmp/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz
-sudo rm /tmp/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz
+ARCH="$(uname -m)"
+DOWNLOAD_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz"
+TEMP_DIR="$(mktemp -d)"
+TEMP_FILE="${TEMP_DIR}/zig-${ZIG_VERSION}.tar.xz"
+SIGNATURE_FILE="${TEMP_FILE}.minisig"
+
+CLEANUP_FILES+=("$TEMP_DIR")
+
+echo "Installing Zig $ZIG_VERSION"
+echo "Downloading from: $DOWNLOAD_URL"
+
+if ! wget -q --show-progress -O "$TEMP_FILE" "$DOWNLOAD_URL"; then
+    echo "Error: Failed to download Zig $ZIG_VERSION" >&2
+    exit 1
+fi
+
+echo "Downloading signature..."
+if ! wget -q --show-progress -O "$SIGNATURE_FILE" "${DOWNLOAD_URL}.minisig"; then
+    echo "Error: Failed to download signature file" >&2
+    exit 1
+fi
+
+echo "Fetching minisign public key..."
+ZIG_MINISIGN_PUBKEY="$(get_minisign_pubkey)"
+
+verify_signature "$TEMP_FILE" "$SIGNATURE_FILE" "$ZIG_MINISIGN_PUBKEY"
+
+echo "Extracting to $INSTALL_DIR..."
+
+if [[ -d "$INSTALL_DIR" ]]; then
+    sudo rm -rf "$INSTALL_DIR"
+fi
+
+sudo mkdir -p "$INSTALL_DIR"
+sudo tar --strip=1 -C "$INSTALL_DIR" -xf "$TEMP_FILE"
+
+# Verify binary exists after extraction
+if [[ ! -x "$INSTALL_DIR/zig" ]]; then
+    echo "Error: zig binary not found at $INSTALL_DIR/zig after extraction" >&2
+    exit 1
+fi
+
+# Create symlink in /usr/local/bin
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "$INSTALL_DIR/zig" /usr/local/bin/zig
+echo "Created symlink: /usr/local/bin/zig -> $INSTALL_DIR/zig"
+
+echo "Zig $ZIG_VERSION installed successfully"
+"$INSTALL_DIR/zig" version

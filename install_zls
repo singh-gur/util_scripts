@@ -1,17 +1,239 @@
 #!/bin/bash
+set -euo pipefail
 
-if command -v zig &>/dev/null; then
-  ZIG_VERSION="$(zig version | awk -F. '{OFS="."; $NF=0; print}')"
-  #cd /tmp
-  wget https://github.com/zigtools/zls/releases/download/$ZIG_VERSION/zls-$(uname -m)-linux.tar.xz
-  [ -d /tmp/zls ] && rm -rf /tmp/zls
-  mkdir /tmp/zls
-  tar -C /tmp/zls -xf ./zls-$(uname -m)-linux.tar.xz
-  sudo install /tmp/zls/zls /usr/local/bin
-  # cleanup
-  [ -d /tmp/zls ] && rm -rf /tmp/zls
-  [ -f ./zls-$(uname -m)-linux.tar.xz ] && rm -rf ./zls-$(uname -m)-linux.tar.xz
-  cd -
-else
-  echo "Please install zig first"
+ZLS_VERSION=""
+FORCE=""
+INSTALL_DIR="/usr/local/bin"
+CLEANUP_FILES=()
+
+usage() {
+    cat << EOF
+usage: install_zls [options]
+
+Install Zig Language Server (ZLS).
+
+Options:
+  -v, --version VERSION    ZLS version to install (default: matches Zig version)
+  -f, --force              Force reinstall even if already installed
+  -h, --help               Show this help message
+
+Examples:
+  $0                       Install version matching Zig
+  $0 --version 0.11.0      Install specific version
+  $0 -v 0.11.0 --force     Force reinstall specific version
+
+Note: ZLS requires Zig to be installed first.
+EOF
+}
+
+cleanup() {
+    local exit_code=$?
+    if [[ ${#CLEANUP_FILES[@]} -gt 0 ]]; then
+        for item in "${CLEANUP_FILES[@]}"; do
+            if [[ -d "$item" ]]; then
+                rm -rf "$item"
+            elif [[ -f "$item" ]]; then
+                rm -f "$item"
+            fi
+        done
+    fi
+    exit $exit_code
+}
+
+trap cleanup EXIT
+
+validate_dependencies() {
+    local missing_deps=()
+
+    for cmd in curl wget jq tar sudo zig minisign; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_deps+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing_deps[*]}" >&2
+        if [[ " ${missing_deps[*]} " =~ " zig " ]]; then
+            echo "Please install Zig first using install_zig" >&2
+        fi
+        exit 1
+    fi
+}
+
+verify_signature() {
+    local file="$1"
+    local signature="$2"
+    local public_key="$3"
+
+    echo "Verifying signature..."
+    if ! minisign -Vm "$file" -x "$signature" -P "$public_key"; then
+        echo "Error: Signature verification failed for $file" >&2
+        echo "The download may be corrupted or tampered with." >&2
+        exit 1
+    fi
+    echo "Signature verified successfully"
+}
+
+get_minisign_pubkey() {
+    local url="https://zigtools.org/zls/install/"
+    local page
+    local pubkey
+
+    page="$(curl -fsSL "$url")" || {
+        echo "Error: Failed to fetch minisign public key page: $url" >&2
+        exit 1
+    }
+
+    pubkey="$(awk '
+        match($0, /RW[A-Za-z0-9+\/=]+/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ' <<< "$page")"
+
+    if [[ -z "$pubkey" ]]; then
+        echo "Error: Failed to find minisign public key on $url" >&2
+        exit 1
+    fi
+
+    echo "$pubkey"
+}
+
+get_compatible_zls_version() {
+    local zig_version
+    zig_version="$(zig version)"
+    
+    # Check if it's a stable semver version (e.g., 0.15.1)
+    if [[ ! "$zig_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "Error: Zig version '$zig_version' is not a stable release" >&2
+        echo "Please specify ZLS version explicitly with --version" >&2
+        exit 1
+    fi
+    
+    # Extract major.minor prefix (e.g., 0.15 from 0.15.1)
+    local prefix
+    prefix="$(echo "$zig_version" | cut -d. -f1,2)"
+    
+    # Query GitHub API for ZLS releases (already sorted newest-first)
+    local releases
+    releases="$(curl -fsSL https://api.github.com/repos/zigtools/zls/releases)" || {
+        echo "Error: Failed to fetch ZLS releases" >&2
+        exit 1
+    }
+    
+    # Find the first (latest) release matching the prefix
+    local matching_version
+    matching_version="$(echo "$releases" | jq -r --arg prefix "${prefix}." '[.[] | select(.tag_name | startswith($prefix))][0].tag_name // empty')"
+    
+    if [[ -z "$matching_version" || "$matching_version" == "null" ]]; then
+        echo "Error: No ZLS release found matching Zig version $zig_version" >&2
+        echo "Available ZLS releases may not be compatible." >&2
+        echo "Please specify a version explicitly with --version" >&2
+        exit 1
+    fi
+    
+    echo "$matching_version"
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -v|--version)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --version requires a value" >&2
+                exit 1
+            fi
+            ZLS_VERSION="$2"
+            shift 2
+            ;;
+        -v=*|--version=*)
+            ZLS_VERSION="${1#*=}"
+            if [[ -z "$ZLS_VERSION" ]]; then
+                echo "Error: --version requires a value" >&2
+                exit 1
+            fi
+            shift
+            ;;
+        -f|--force)
+            FORCE="Y"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+    esac
+done
+
+validate_dependencies
+
+if [[ -z "$ZLS_VERSION" ]]; then
+    echo "Finding compatible ZLS version for installed Zig..."
+    ZLS_VERSION="$(get_compatible_zls_version)"
+    echo "Selected ZLS version: $ZLS_VERSION"
 fi
+
+if [[ -z "$FORCE" ]]; then
+    if command -v zls &> /dev/null; then
+        CURR_VERSION="$(zls --version 2>/dev/null || echo "unknown")"
+        if [[ "$CURR_VERSION" == "$ZLS_VERSION" ]]; then
+            echo "ZLS $ZLS_VERSION is already installed"
+            exit 0
+        fi
+        echo "Current version: $CURR_VERSION"
+    fi
+fi
+
+ARCH="$(uname -m)"
+DOWNLOAD_URL="https://github.com/zigtools/zls/releases/download/${ZLS_VERSION}/zls-${ARCH}-linux.tar.xz"
+TEMP_DIR="$(mktemp -d)"
+TEMP_FILE="${TEMP_DIR}/zls-${ZLS_VERSION}.tar.xz"
+SIGNATURE_FILE="${TEMP_FILE}.minisig"
+EXTRACT_DIR="${TEMP_DIR}/extracted"
+
+CLEANUP_FILES+=("$TEMP_DIR")
+
+echo "Installing ZLS $ZLS_VERSION"
+echo "Downloading from: $DOWNLOAD_URL"
+
+if ! wget -q --show-progress -O "$TEMP_FILE" "$DOWNLOAD_URL"; then
+    echo "Error: Failed to download ZLS $ZLS_VERSION" >&2
+    echo "Check if version $ZLS_VERSION exists at: https://github.com/zigtools/zls/releases" >&2
+    exit 1
+fi
+
+echo "Downloading signature..."
+if ! wget -q --show-progress -O "$SIGNATURE_FILE" "${DOWNLOAD_URL}.minisig"; then
+    echo "Error: Failed to download signature file" >&2
+    exit 1
+fi
+
+echo "Fetching minisign public key..."
+ZLS_MINISIGN_PUBKEY="$(get_minisign_pubkey)"
+
+verify_signature "$TEMP_FILE" "$SIGNATURE_FILE" "$ZLS_MINISIGN_PUBKEY"
+
+echo "Extracting..."
+
+mkdir -p "$EXTRACT_DIR"
+tar -C "$EXTRACT_DIR" -xf "$TEMP_FILE"
+
+# Verify binary exists
+if [[ ! -f "$EXTRACT_DIR/zls" ]]; then
+    echo "Error: zls binary not found in extracted archive" >&2
+    echo "Archive contents:" >&2
+    ls -la "$EXTRACT_DIR" >&2
+    exit 1
+fi
+
+echo "Installing to $INSTALL_DIR..."
+sudo mkdir -p "$INSTALL_DIR"
+sudo install -m 755 "$EXTRACT_DIR/zls" "$INSTALL_DIR/zls"
+
+echo "ZLS $ZLS_VERSION installed successfully"
+INSTALLED_VERSION="$("$INSTALL_DIR/zls" --version 2>/dev/null || echo "$ZLS_VERSION")"
+echo "Installed: $INSTALLED_VERSION"
