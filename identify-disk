@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENCLOSURE="/dev/sg11"
+ACTION="on"
+TARGET=""
+
+usage() {
+  cat <<EOF
+Usage:
+  identify-disk --serial SERIAL [--off]
+  identify-disk --disk /dev/sdX [--off]
+  identify-disk --slot N [--off]
+  identify-disk --list
+  identify-disk --status
+EOF
+}
+
+find_disk_by_serial() {
+  local serial="$1"
+  lsblk -d -n -o NAME,SERIAL | awk -v s="$serial" '$2 == s {print "/dev/" $1; exit}'
+}
+
+disk_to_slot() {
+  local disk
+  disk="$(basename "$1")"
+  readlink -f "/sys/block/$disk/device" | awk -F/ '{print $NF}' | awk -F: '{print $3}'
+}
+
+list_disks() {
+  lsblk -d -o NAME,MODEL,SERIAL,SIZE
+  echo
+  for d in /dev/sd? /dev/sd??; do
+    [[ -b "$d" ]] || continue
+    serial="$(lsblk -d -n -o SERIAL "$d" | xargs || true)"
+    slot="$(disk_to_slot "$d" || true)"
+    printf "%-8s slot=%-4s serial=%s\n" "$d" "${slot:-unknown}" "${serial:-unknown}"
+  done
+}
+
+status() {
+  sudo sg_ses -p ec "$ENCLOSURE" | grep -E "Element [0-9]+ descriptor:|Ident="
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --serial)
+      TARGET="$(find_disk_by_serial "$2")"
+      shift 2
+      ;;
+    --disk)
+      TARGET="$2"
+      shift 2
+      ;;
+    --slot)
+      TARGET="slot:$2"
+      shift 2
+      ;;
+    --off)
+      ACTION="off"
+      shift
+      ;;
+    --on)
+      ACTION="on"
+      shift
+      ;;
+    --enclosure)
+      ENCLOSURE="$2"
+      shift 2
+      ;;
+    --list)
+      list_disks
+      exit 0
+      ;;
+    --status)
+      status
+      exit 0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$TARGET" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ "$TARGET" == slot:* ]]; then
+  SLOT="${TARGET#slot:}"
+else
+  if [[ ! -b "$TARGET" ]]; then
+    echo "Disk not found: $TARGET"
+    exit 1
+  fi
+  SLOT="$(disk_to_slot "$TARGET")"
+fi
+
+if [[ "$ACTION" == "on" ]]; then
+  echo "Turning IDENT ON for slot $SLOT using $ENCLOSURE"
+  sudo sg_ses --index="$SLOT" --set=ident "$ENCLOSURE"
+else
+  echo "Turning IDENT OFF for slot $SLOT using $ENCLOSURE"
+  sudo sg_ses --index="$SLOT" --clear=ident "$ENCLOSURE"
+fi
+
+sudo sg_ses -p ec "$ENCLOSURE" | awk -v s="$SLOT" '
+  $0 ~ "Element " s " descriptor:" {p=1}
+  p && /Ident=/ {print; exit}
+'
