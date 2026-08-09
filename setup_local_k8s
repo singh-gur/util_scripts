@@ -8,13 +8,14 @@ echo "Setting up Minikube with ArgoCD"
 
 # Default values
 NODES=1
-DRIVER="virtualbox"
+DRIVER="kvm2"
 MEMORY="4096"
 REPO_URL="git@github.com:singh-gur/helm_charts.git"
 SSH_KEY=""
 APP_PATH="charts/root-app"
 VALUES_FILE="values_local.yaml"
 FORCE=""
+SKIP_ARGOCD=""
 
 usage()
 {
@@ -23,7 +24,7 @@ Usage: setup_local_k8s [options]
 
 Options:
     -n, --nodes         Number of nodes for minikube cluster (default: 1)
-    -d, --driver        Minikube driver to use (default: virtualbox)
+    -d, --driver        Minikube driver to use (default: kvm2)
                         Options: docker, kvm2, virtualbox, podman, etc.
     -m, --memory        Memory allocation per node in MB (default: 4096)
     -r, --repo          Git repository URL for ArgoCD (default: git@github.com:singh-gur/helm_charts.git)
@@ -31,6 +32,7 @@ Options:
     -p, --app-path      Path to root app in repository (default: charts/root-app)
     -v, --values        Values file to use (default: values_local.yaml)
     -f, --force         Force delete existing minikube cluster and recreate
+    -s, --skip-argocd   Skip ArgoCD installation and repository/app configuration
     -i, --info          Show ArgoCD access info if cluster is already running and configured
     -h, --help          Show this help message
 
@@ -162,6 +164,9 @@ while [ "$1" != "" ]; do
         -f | --force )
             FORCE="Y"
         ;;
+        -s | --skip-argocd )
+            SKIP_ARGOCD="Y"
+        ;;
         -i | --info )
             INFO="Y"
         ;;
@@ -207,14 +212,14 @@ if ! command -v kubectl &> /dev/null; then
     exit 1
 fi
 
-if ! command -v curl &> /dev/null; then
+if [[ -z "$SKIP_ARGOCD" ]] && ! command -v curl &> /dev/null; then
     echo "Error: curl is not installed"
     echo "Please install curl to download ArgoCD manifests"
     exit 1
 fi
 
 # Validate SSH key if using SSH repo
-if [[ "$REPO_URL" == git@* ]] || [[ "$REPO_URL" == ssh://* ]]; then
+if [[ -z "$SKIP_ARGOCD" ]] && { [[ "$REPO_URL" == git@* ]] || [[ "$REPO_URL" == ssh://* ]]; }; then
     if [[ -z "$SSH_KEY" ]]; then
         echo "Error: SSH key is required for SSH repository URLs"
         echo "Please provide --ssh-key parameter"
@@ -286,6 +291,20 @@ echo "Addons enabled successfully"
 # Wait for cluster to be ready
 echo "Waiting for cluster to be ready..."
 kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+if [[ -n "$SKIP_ARGOCD" ]]; then
+    echo "Skipping ArgoCD installation and configuration (--skip-argocd)"
+    echo ""
+    echo "=========================================="
+    echo "Setup completed successfully!"
+    echo "=========================================="
+    echo ""
+    echo "Minikube cluster information:"
+    kubectl cluster-info
+    echo ""
+    echo "IMPORTANT: Your kubectl context is now set to 'minikube'"
+    exit 0
+fi
 
 # Install ArgoCD
 echo "Installing ArgoCD in namespace 'argocd'..."
