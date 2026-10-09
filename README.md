@@ -234,6 +234,23 @@ Install or update Neovim editor.
 ./install_nvim --version=v0.9.5 --force
 ```
 
+#### `install_oc_desk`
+Install or update OpenCode Desktop v2 on x86_64 Linux, with automatic deb/rpm detection.
+Uses the [official OpenCode downloads](https://opencode.ai/download), not GitHub's v1 latest release.
+Requires `curl`; package installation uses `sudo` and the system package manager.
+
+**Usage:**
+```bash
+# Install the latest stable v2 release (asks for confirmation)
+./install_oc_desk
+
+# Install a specific v2 release without confirmation
+./install_oc_desk --version=2.0.26 --yes
+
+# Reinstall even if the version is already installed
+./install_oc_desk --force
+```
+
 #### `install_zig`
 Install or update Zig programming language.
 

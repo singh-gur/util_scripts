@@ -5,15 +5,13 @@ set -u
 set -o pipefail
 
 # OpenCode Desktop Installer
-# Identifies the latest version from GitHub releases and installs the appropriate
+# Identifies the latest v2 release from opencode.ai and installs the appropriate
 # deb or rpm package for the current system
 
 VERSION="1.0.0"
 SCRIPT_NAME=$(basename "$0")
 
-REPO_OWNER="anomalyco"
-REPO_NAME="opencode"
-GITHUB_API="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+DOWNLOAD_BASE="https://opencode.ai"
 
 # Default configuration
 OC_VERSION=""
@@ -54,18 +52,18 @@ usage() {
     cat << EOF
 Usage: $SCRIPT_NAME [options]
 
-Install OpenCode Desktop from GitHub releases.
-Automatically detects package format (deb/rpm) based on the current system.
+Install OpenCode Desktop v2 from the official opencode.ai downloads.
+Automatically detects package format (deb/rpm) on x86_64 Linux systems.
 
 Options:
-  -v, --version VERSION   Specific version to install (default: latest)
+  -v, --version VERSION   Specific v2 version to install (default: latest stable v2)
   -f, --force            Reinstall even if the same version is already installed
   -y, --yes              Skip confirmation prompt
   -h, --help             Show this help message
 
 Examples:
   $SCRIPT_NAME                        # Install latest version
-  $SCRIPT_NAME --version=1.14.48      # Install specific version
+  $SCRIPT_NAME --version=2.0.26       # Install specific v2 version
   $SCRIPT_NAME --force                # Reinstall even if up to date
   $SCRIPT_NAME --yes                  # Skip confirmation
 
@@ -77,11 +75,19 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             -v|--version)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--version requires a version argument"
+                    exit 1
+                fi
                 OC_VERSION="$2"
                 shift 2
                 ;;
             --version=*)
                 OC_VERSION="${1#*=}"
+                if [[ -z "$OC_VERSION" ]]; then
+                    log_error "--version requires a version argument"
+                    exit 1
+                fi
                 shift
                 ;;
             -f|--force)
@@ -111,10 +117,6 @@ validate_dependencies() {
 
     if ! command -v curl &> /dev/null; then
         missing_deps+=("curl")
-    fi
-
-    if ! command -v jq &> /dev/null; then
-        missing_deps+=("jq")
     fi
 
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
@@ -171,19 +173,24 @@ detect_pkg_type() {
     fi
 }
 
-# Fetch the latest version from GitHub API
+# The official stable download redirects to a versioned v2 package.
+# GitHub's /releases/latest endpoint still tracks v1.
 fetch_latest_version() {
-    local version
-    version=$(curl -s "$GITHUB_API" | jq -r '.tag_name')
-
-    if [[ -z "$version" || "$version" == "null" ]]; then
-        log_error "Failed to fetch latest version from GitHub"
+    local pkg_type="$1"
+    local download_url
+    if ! download_url=$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
+        "${DOWNLOAD_BASE}/download/stable/linux-x64-${pkg_type}"); then
+        log_error "Failed to fetch latest v2 version from opencode.ai"
         exit 1
     fi
 
-    # Strip leading 'v' if present
-    version="${version#v}"
-    echo "$version"
+    if [[ "$download_url" != "${DOWNLOAD_BASE}/files/bin/"* ]]; then
+        log_error "Unexpected latest download URL: $download_url"
+        exit 1
+    fi
+
+    local version="${download_url%/*}"
+    echo "${version##*/}"
 }
 
 # Build the download URL based on version and package type
@@ -193,10 +200,10 @@ build_download_url() {
 
     case "$pkg_type" in
         deb)
-            echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${version}/opencode-desktop-linux-amd64.deb"
+            echo "${DOWNLOAD_BASE}/files/bin/${version}/opencode-desktop-linux-amd64.deb"
             ;;
         rpm)
-            echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${version}/opencode-desktop-linux-x86_64.rpm"
+            echo "${DOWNLOAD_BASE}/files/bin/${version}/opencode-desktop-linux-x86_64.rpm"
             ;;
         *)
             log_error "Unsupported package type: $pkg_type"
@@ -219,10 +226,14 @@ check_installed_version() {
 
     case "$pkg_type" in
         deb)
-            installed_version=$(dpkg-query -W -f='${Version}' opencode-desktop 2>/dev/null || echo "")
+            if ! installed_version=$(dpkg-query -W -f='${Version}' opencode 2>/dev/null); then
+                installed_version=""
+            fi
             ;;
         rpm)
-            installed_version=$(rpm -q --queryformat '%{VERSION}' opencode-desktop 2>/dev/null || echo "")
+            if ! installed_version=$(rpm -q --queryformat '%{VERSION}' opencode 2>/dev/null); then
+                installed_version=""
+            fi
             ;;
     esac
 
@@ -237,12 +248,23 @@ main() {
     local pkg_type
     pkg_type=$(detect_pkg_type)
 
+    if [[ "$(uname -m)" != "x86_64" ]]; then
+        log_error "This installer supports x86_64 Linux systems only."
+        exit 1
+    fi
+
     # Determine version to install
     if [[ -z "$OC_VERSION" ]]; then
-        OC_VERSION=$(fetch_latest_version)
+        OC_VERSION=$(fetch_latest_version "$pkg_type")
         log_info "Latest version: $OC_VERSION"
     else
         log_info "Requested version: $OC_VERSION"
+    fi
+
+    OC_VERSION="${OC_VERSION#v}"
+    if [[ ! "$OC_VERSION" =~ ^2\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Expected a v2 release version (2.x.y), got: $OC_VERSION"
+        exit 1
     fi
 
     # Check if already installed
