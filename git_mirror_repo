@@ -398,8 +398,9 @@ push_target() {
     fi
 
     if [[ "$has_filters" == "false" ]]; then
-        echo "Mode: mirror push (all refs)"
-        if ! git -C "$CLONE_DIR" push --mirror "$target_url"; then
+        echo "Mode: mirror push (branches and tags)"
+        # Not --mirror: GitHub's refs/pull/* are rejected by Forgejo/Gitea pre-receive hooks, failing the whole push.
+        if ! git -C "$CLONE_DIR" push --prune "$target_url" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'; then
             if [[ "$STRICT" == "true" ]]; then
                 echo "Error: Failed to push to target repository" >&2
                 exit 1
@@ -532,7 +533,7 @@ push_target_dry_run() {
             done < <(git -C "$CLONE_DIR" for-each-ref --format='%(refname)' refs/tags/)
         fi
     else
-        echo "[DRY RUN] git push --mirror \"$TARGET\""
+        echo "[DRY RUN] git push --prune \"$TARGET\" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'"
     fi
 }
 
